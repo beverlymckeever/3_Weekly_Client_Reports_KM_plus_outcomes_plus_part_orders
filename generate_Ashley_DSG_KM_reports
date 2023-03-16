@@ -1,0 +1,28 @@
+-- PARM 1 = CLIENT ID
+-- PARM 2 = SUPERZONE ID
+-- PARM 3 = REPORT REQUESTED (1=BY MTH, 2=BY WK)
+-- PARM 4 = REPORT FORMAT (1=EXCL RESPONSE TIME SECTION, 2=INCL RESPONSE TIME SECTION
+
+CALL sp_client_Key_Measures_report(289,0,1,1);   		-- Ashley DSG CHI KM Report By Mth
+CALL sp_client_Key_Measures_report(289,0,2,1);   		-- Ashley DSG CHI KM Report By Wk
+
+CALL sp_client_Key_Measures_report(178,0,1,1);   		-- Ashley DSG INDY KM Report By Mth
+CALL sp_client_Key_Measures_report(178,0,2,1);   		-- Ashley DSG INDY KM Report By Wk
+
+CALL sp_client_Key_Measures_report(179,0,1,1);   		-- Ashley DSG LOUY KM Report By Mth
+CALL sp_client_Key_Measures_report(179,0,2,1);   		-- Ashley DSG LOUY KM Report By Wk
+
+CALL sp_client_Key_Measures_report(313,0,1,1);   		-- Ashley DSG MI KM Report By Mth
+CALL sp_client_Key_Measures_report(313,0,2,1);   		-- Ashley DSG MI KM Report By Wk
+
+CALL sp_client_Key_Measures_report(319,0,1,1);   		-- Ashley DSG MI Warehouse KM Report By Mth
+CALL sp_client_Key_Measures_report(319,0,2,1);   		-- Ashley DSG MI Warehouse KM Report By Wk
+
+CALL sp_client_Key_Measures_report(181,0,1,1);   		-- Ashley DSG MPHS KM Report By Mth
+CALL sp_client_Key_Measures_report(181,0,2,1);   		-- Ashley DSG MPHS Warehouse KM Report By Wk
+
+-- CALL sp_client_Key_Measures_report(210,0,1,1);   		-- Ashley DSG NASH KM Report By Mth
+-- CALL sp_client_Key_Measures_report(210,0,2,1);   		-- Ashley DSG NASH KM Report By Wk
+
+CALL sp_client_Key_Measures_report(182,0,1,1);   		-- Ashley DSG STL KM Report By Mth
+CALL sp_client_Key_Measures_report(182,0,2,1);   		-- Ashley DSG STL KM Report By Wk
