@@ -11,14 +11,15 @@ BEGIN
 -- populate the file holding Client Key Measures data for the previous week.  It is run Wednesday 
 -- morning to ensure all the tech reports for the previous week have been entered and finalized.  
 -- 
--- This procedure is broken down into 5 major steps.
+-- This procedure is broken down into 6 major steps.
 -- 	Step 1: Clear and populate table bevy.client_KM_time_frames with the time frames (12 mths; 12 wks)
--- 	Step 2: Clear and populate temp table bevy.client_KM_survey_counts then use it to populate table bevy.client_KM counts
---		Step 3: Clear and populate temp table bevy.client_KM_cancelled_service_order_counts then use it to populate table bevy.client_KM counts
--- 	Step 4: Clear and populate temp table bevy.client_KM_so_outcomes_summary_counts then use it to populate table bevy.client_KM counts
--- 	Step 5: Clear and populate temp table bevy.fr_outcome_rpts_count then use it in step 6 <-- added 05/24/2022
---    Step 6: Clear and populate temp table bevy.client_KM_item_outcomes_summary_counts then use it to populate table bevy.client_KM counts
---
+-- 	Step 2: Clear and populate temp table bevy.survey_dtl then use it to populate table bevy.client_KM counts
+--		Step 3: Clear and populate temp table bevy.cancelled_so then use it to populate table bevy.client_KM counts
+-- 	Step 4: Clear and populate temp table bevy.appts_having_mult_tech_rpts
+-- 	Step 5: Clear and populate temp table bevy.so_outcomes then use it to populate table bevy.client_KM counts
+--            Clear and populate temp table bevy.items_missing_outcomes_rpt
+-- 	Step 6: Clear and populate temp table bevy.item_outcomes then use it to populate table bevy.client_KM counts
+-- 
 --  Maintenance:
 -- 		09/25/2020:  Removed input_date as a parameter.  The input_date is the report thru date.  Added code to derive the report thru date.
 --       06/14/2022:  Changed from rolling 12 months to calendar year.  Changed formula to derive thru date, from date. Changed formula to 
