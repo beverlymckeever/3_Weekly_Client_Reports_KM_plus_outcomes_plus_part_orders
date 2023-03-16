@@ -1,0 +1,10 @@
+CALL sp_outcomes_report_for_KM(289,0); 			-- Ashley DSG CHI
+CALL sp_outcomes_report_for_KM(178,0); 			-- Ashley DSG INDY
+CALL sp_outcomes_report_for_KM(179,0); 			-- Ashley DSG LOUY
+CALL sp_outcomes_report_for_KM(313,0); 			-- Ashley DSG MI
+CALL sp_outcomes_report_for_KM(319,0); 			-- Ashley DSG MI Warehouse
+CALL sp_outcomes_report_for_KM(181,0); 			-- Ashley DSG MPHS
+CALL sp_outcomes_report_for_KM(182,0); 			-- Ashley DSG STL
+CALL sp_outcomes_report_for_KM(163,0); 			-- LS
+CALL sp_outcomes_report_for_KM(5,0); 				-- Montage
+CALL sp_outcomes_report_for_KM(102,0); 			-- Morris
