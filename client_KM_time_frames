@@ -1,0 +1,24 @@
+CREATE TABLE `client_KM_time_frames` (
+	`id` INT(11) NOT NULL AUTO_INCREMENT,
+	`from_date` DATE NULL DEFAULT NULL,
+	`thru_date` DATE NULL DEFAULT NULL,
+	`time_period_descr` VARCHAR(50) NULL DEFAULT NULL,
+	`time_period_01` CHAR(7) NULL DEFAULT NULL,
+	`time_period_02` CHAR(7) NULL DEFAULT NULL,
+	`time_period_03` CHAR(7) NULL DEFAULT NULL,
+	`time_period_04` CHAR(7) NULL DEFAULT NULL,
+	`time_period_05` CHAR(7) NULL DEFAULT NULL,
+	`time_period_06` CHAR(7) NULL DEFAULT NULL,
+	`time_period_07` CHAR(7) NULL DEFAULT NULL,
+	`time_period_08` CHAR(7) NULL DEFAULT NULL,
+	`time_period_09` CHAR(7) NULL DEFAULT NULL,
+	`time_period_10` CHAR(7) NULL DEFAULT NULL,
+	`time_period_11` CHAR(7) NULL DEFAULT NULL,
+	`time_period_12` CHAR(7) NULL DEFAULT NULL,
+	PRIMARY KEY (`id`),
+	INDEX `time_period_descr` (`time_period_descr`)
+)
+COLLATE='latin1_swedish_ci'
+ENGINE=InnoDB
+AUTO_INCREMENT=5
+;
