@@ -1,0 +1,2825 @@
+CREATE DEFINER=`bev`@`%` PROCEDURE `sp_Client_Key_Measures_weekly_build`()
+LANGUAGE SQL
+NOT DETERMINISTIC
+CONTAINS SQL
+SQL SECURITY DEFINER
+COMMENT ''
+BEGIN
+
+-- ============================================================================================================================================
+-- This procedure is set up to run weekly (Wednesday morning before start of business) to clear and 
+-- populate the file holding Client Key Measures data for the previous week.  It is run Wednesday 
+-- morning to ensure all the tech reports for the previous week have been entered and finalized.  
+-- 
+-- This procedure is broken down into 5 major steps.
+-- 	Step 1: Clear and populate table bevy.client_KM_time_frames with the time frames (12 mths; 12 wks)
+-- 	Step 2: Clear and populate temp table bevy.client_KM_survey_counts then use it to populate table bevy.client_KM counts
+--		Step 3: Clear and populate temp table bevy.client_KM_cancelled_service_order_counts then use it to populate table bevy.client_KM counts
+-- 	Step 4: Clear and populate temp table bevy.client_KM_so_outcomes_summary_counts then use it to populate table bevy.client_KM counts
+-- 	Step 5: Clear and populate temp table bevy.fr_outcome_rpts_count then use it in step 6 <-- added 05/24/2022
+--    Step 6: Clear and populate temp table bevy.client_KM_item_outcomes_summary_counts then use it to populate table bevy.client_KM counts
+--
+--  Maintenance:
+-- 		09/25/2020:  Removed input_date as a parameter.  The input_date is the report thru date.  Added code to derive the report thru date.
+--       06/14/2022:  Changed from rolling 12 months to calendar year.  Changed formula to derive thru date, from date. Changed formula to 
+-- 						 derive the 12 weeks. Added totals for "mattress inspections" and "excl mattress inspections". Modifed code to run more
+--                    efficient with respect to error handling (i.e. mult tech rpts for same s.o.; missing outcome reports (no repair report,
+--                    cleaning report or mattress report. 
+-- ============================================================================================================================================
+
+
+-- =====================================================================================================
+-- Step 1: Clear and populate table bevy.client_KM_time_frames with the time frames (12 mths; 12 wks)
+-- =====================================================================================================
+
+			-- ============================================================================================
+			-- Derive Client Key Measures Report week ending date.  All tech reports need to be entered 
+			-- for the week before generating the Key Measures for that week.  By Tuesday EOB all the tech 
+			-- reports should be completed for the prior week.  Therefore, if Key Measures reports are
+			-- generated on a Monday or Tuesday, then the week ending date will be that of 2 Sundays ago.  
+			-- Otherwise, it will be the previous Sunday date.  
+			-- ============================================================================================
+
+				SET @cur_date := CURDATE();
+			
+				SET @cur_day := DAYOFWEEK(@cur_date);
+
+
+-- removed 06/14/2022
+--          SET @thru_date := ...  <- changed this to @work_thru_date.  			
+--						CASE WHEN @cur_day = 1 THEN DATE_SUB(@cur_date, INTERVAL 7 day) ELSE   -- cur day is Sun, so reporting on week ending prev Sun (7 days ago)
+--						CASE WHEN @cur_day = 2 THEN DATE_SUB(@cur_date, INTERVAL 8 day) ELSE   -- cur day is Mon, so reporting on week ending Sun before last (8 days ago)
+--						CASE WHEN @cur_day = 3 THEN DATE_SUB(@cur_date, INTERVAL 9 day) ELSE   -- cur day is Tue, so reporting on week ending Sun before last (9 days ago)
+--						CASE WHEN @cur_day = 4 THEN DATE_SUB(@cur_date, INTERVAL 3 day) ELSE   -- cur day is Wed, so reporting on week ending prev Sun (3 days ago)
+--						CASE WHEN @cur_day = 5 THEN DATE_SUB(@cur_date, INTERVAL 4 day) ELSE   -- cur day is Thu, so reporting on week ending prev Sun (4 days ago)
+--						CASE WHEN @cur_day = 6 THEN DATE_SUB(@cur_date, INTERVAL 5 day) ELSE   -- cur day is Fri, so reporting on week ending prev Sun (5 days ago)
+--															 DATE_SUB(@cur_date, INTERVAL 6 day) 
+--						END END END END END END;			  												  -- cur day is Sat, so reporting on week ending prev Sun (6 days ago)
+
+-- added 06/14/2022
+				SET @work_thru_date :=	  --  @thru_date replaced 06/14/2022 
+						CASE WHEN @cur_day = 1 THEN DATE_SUB(@cur_date, INTERVAL 7 day) ELSE   -- cur day is Sun, so reporting on week ending prev Sun (7 days ago)
+						CASE WHEN @cur_day = 2 THEN DATE_SUB(@cur_date, INTERVAL 8 day) ELSE   -- cur day is Mon, so reporting on week ending Sun before last (8 days ago)
+						CASE WHEN @cur_day = 3 THEN DATE_SUB(@cur_date, INTERVAL 9 day) ELSE   -- cur day is Tue, so reporting on week ending Sun before last (9 days ago)
+						CASE WHEN @cur_day = 4 THEN DATE_SUB(@cur_date, INTERVAL 3 day) ELSE   -- cur day is Wed, so reporting on week ending prev Sun (3 days ago)
+						CASE WHEN @cur_day = 5 THEN DATE_SUB(@cur_date, INTERVAL 4 day) ELSE   -- cur day is Thu, so reporting on week ending prev Sun (4 days ago)
+						CASE WHEN @cur_day = 6 THEN DATE_SUB(@cur_date, INTERVAL 5 day) ELSE   -- cur day is Fri, so reporting on week ending prev Sun (5 days ago)
+															 DATE_SUB(@cur_date, INTERVAL 6 day) 
+						END END END END END END;			  												  -- cur day is Sat, so reporting on week ending prev Sun (6 days ago)
+
+-- 06/14/2022 @thru_date now only goes to last day of year 12/31. If week spans two years, @thru date will be last day of previous year.  Added calculation
+-- 			  for @beg_date_of_thru_wk
+
+-- added 06/14/2022
+				SET @thru_date := 
+						CASE WHEN YEAR(DATE_SUB(@work_thru_date,INTERVAL 6 DAY)) <> YEAR(@work_thru_date)		
+							  THEN CONCAT(YEAR(DATE_SUB(@work_thru_date,INTERVAL 6 DAY)),'-12-31') 
+							  ELSE @work_thru_date
+						END; 
+
+-- added 06/14/2022
+				SET @beg_date_of_thru_wk :=
+						CASE WHEN DAYNAME(@thru_date) = 'Monday' THEN @thru_date ELSE
+						CASE WHEN DAYNAME(@thru_date) = 'Tuesday' THEN DATE_SUB(@thru_date,INTERVAL 1 DAY) ELSE
+						CASE WHEN DAYNAME(@thru_date) = 'Wednesday' THEN DATE_SUB(@thru_date,INTERVAL 2 DAY) ELSE
+						CASE WHEN DAYNAME(@thru_date) = 'Thursday' THEN DATE_SUB(@thru_date,INTERVAL 3 DAY) ELSE
+						CASE WHEN DAYNAME(@thru_date) = 'Friday' THEN DATE_SUB(@thru_date,INTERVAL 4 DAY) ELSE
+						CASE WHEN DAYNAME(@thru_date) = 'Saturday' THEN DATE_SUB(@thru_date,INTERVAL 5 DAY) ELSE DATE_SUB(@thru_date,INTERVAL 6 DAY)
+						END END END END END END;
+						
+
+-- removed 06/14/2022      
+--				SET @from_date := DATE_SUB(@thru_date,INTERVAL 11 MONTH); 
+
+-- added 06/14/2022	- Note that @from_date now always starts at first day of the year of @thru_date
+				SET @from_date := CONCAT(YEAR(@thru_date),'-01-01');
+
+-- removed 06/14/2022	- rolling 12 mths.				
+--				SET @mth_01_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 11 MONTH),'%Y%m01');	
+--				SET @mth_02_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 10 MONTH),'%Y%m01');	
+--				SET @mth_03_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 09 MONTH),'%Y%m01');	
+--				SET @mth_04_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 08 MONTH),'%Y%m01');	
+--				SET @mth_05_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 07 MONTH),'%Y%m01');	
+--				SET @mth_06_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 06 MONTH),'%Y%m01');	
+--				SET @mth_07_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 05 MONTH),'%Y%m01');	
+--				SET @mth_08_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 04 MONTH),'%Y%m01');	
+--				SET @mth_09_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 03 MONTH),'%Y%m01');	
+--				SET @mth_10_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 02 MONTH),'%Y%m01');	
+--				SET @mth_11_from_date 	:= DATE_FORMAT(DATE_SUB(@thru_date,INTERVAL 01 MONTH),'%Y%m01');		
+--				SET @mth_12_from_date 	:= DATE_FORMAT(@thru_date,'%Y%m01');	
+
+-- added 06/14/2022	- calendar 12 mths
+				SET @mth_01_from_date 	:= DATE_FORMAT(@thru_date,'%Y0101');
+				SET @mth_02_from_date 	:= DATE_FORMAT(@thru_date,'%Y0201');	
+				SET @mth_03_from_date 	:= DATE_FORMAT(@thru_date,'%Y0301');	
+				SET @mth_04_from_date 	:= DATE_FORMAT(@thru_date,'%Y0401');	
+				SET @mth_05_from_date 	:= DATE_FORMAT(@thru_date,'%Y0501');	
+				SET @mth_06_from_date 	:= DATE_FORMAT(@thru_date,'%Y0601');	
+				SET @mth_07_from_date 	:= DATE_FORMAT(@thru_date,'%Y0701');	
+				SET @mth_08_from_date 	:= DATE_FORMAT(@thru_date,'%Y0801');	
+				SET @mth_09_from_date 	:= DATE_FORMAT(@thru_date,'%Y0901');	
+				SET @mth_10_from_date 	:= DATE_FORMAT(@thru_date,'%Y1001');	
+				SET @mth_11_from_date 	:= DATE_FORMAT(@thru_date,'%Y1101');	
+				SET @mth_12_from_date 	:= DATE_FORMAT(@thru_date,'%Y1201');	
+
+-- --------------------------------------------------------------------------------------------  		
+	
+				SET @mth_01_thru_date 	:= LAST_DAY(@mth_01_from_date);	
+				SET @mth_02_thru_date 	:= LAST_DAY(@mth_02_from_date);	
+				SET @mth_03_thru_date 	:= LAST_DAY(@mth_03_from_date);	
+				SET @mth_04_thru_date 	:= LAST_DAY(@mth_04_from_date);	
+				SET @mth_05_thru_date 	:= LAST_DAY(@mth_05_from_date);	
+				SET @mth_06_thru_date 	:= LAST_DAY(@mth_06_from_date);	
+				SET @mth_07_thru_date 	:= LAST_DAY(@mth_07_from_date);	
+				SET @mth_08_thru_date 	:= LAST_DAY(@mth_08_from_date);	
+				SET @mth_09_thru_date 	:= LAST_DAY(@mth_09_from_date);	
+				SET @mth_10_thru_date 	:= LAST_DAY(@mth_10_from_date);		
+				SET @mth_11_thru_date 	:= LAST_DAY(@mth_11_from_date);	
+
+-- removed 06/14/2022      
+--				SET @mth_12_thru_date 	:= @thru_date;	
+
+-- added 06/14/2022
+				SET @mth_12_thru_date 	:= LAST_DAY(@mth_12_from_date);	
+	
+-- --------------------------------------------------------------------------------------------	
+		
+				SET @mth_01_yyyy_mm 	 := DATE_FORMAT(@mth_01_from_date,'%Y-%m');	
+				SET @mth_02_yyyy_mm 	 := DATE_FORMAT(@mth_02_from_date,'%Y-%m');	
+				SET @mth_03_yyyy_mm 	 := DATE_FORMAT(@mth_03_from_date,'%Y-%m');	
+				SET @mth_04_yyyy_mm 	 := DATE_FORMAT(@mth_04_from_date,'%Y-%m');
+				SET @mth_05_yyyy_mm 	 := DATE_FORMAT(@mth_05_from_date,'%Y-%m');	
+				SET @mth_06_yyyy_mm 	 := DATE_FORMAT(@mth_06_from_date,'%Y-%m');	
+				SET @mth_07_yyyy_mm 	 := DATE_FORMAT(@mth_07_from_date,'%Y-%m');	
+				SET @mth_08_yyyy_mm 	 := DATE_FORMAT(@mth_08_from_date,'%Y-%m');	
+				SET @mth_09_yyyy_mm 	 := DATE_FORMAT(@mth_09_from_date,'%Y-%m');	
+				SET @mth_10_yyyy_mm 	 := DATE_FORMAT(@mth_10_from_date,'%Y-%m');	
+				SET @mth_11_yyyy_mm 	 := DATE_FORMAT(@mth_11_from_date,'%Y-%m');	
+				SET @mth_12_yyyy_mm 	 := DATE_FORMAT(@mth_12_from_date,'%Y-%m');		
+			
+				SET @mth_01_mmm  := LEFT(DATE_FORMAT(@mth_01_from_date,'%M'),3);	
+				SET @mth_02_mmm  := LEFT(DATE_FORMAT(@mth_02_from_date,'%M'),3);	
+				SET @mth_03_mmm  := LEFT(DATE_FORMAT(@mth_03_from_date,'%M'),3);	
+				SET @mth_04_mmm  := LEFT(DATE_FORMAT(@mth_04_from_date,'%M'),3);	
+				SET @mth_05_mmm  := LEFT(DATE_FORMAT(@mth_05_from_date,'%M'),3);	
+				SET @mth_06_mmm  := LEFT(DATE_FORMAT(@mth_06_from_date,'%M'),3);	
+				SET @mth_07_mmm  := LEFT(DATE_FORMAT(@mth_07_from_date,'%M'),3);	
+				SET @mth_08_mmm  := LEFT(DATE_FORMAT(@mth_08_from_date,'%M'),3);	
+				SET @mth_09_mmm  := LEFT(DATE_FORMAT(@mth_09_from_date,'%M'),3);	
+				SET @mth_10_mmm  := LEFT(DATE_FORMAT(@mth_10_from_date,'%M'),3);	
+				SET @mth_11_mmm  := LEFT(DATE_FORMAT(@mth_11_from_date,'%M'),3);	
+				SET @mth_12_mmm  := LEFT(DATE_FORMAT(@mth_12_from_date,'%M'),3);	
+
+
+-- 06/14/22: Replaced the following code which calculates the @wk_01_beg_date and the 12 wk end dates 
+-- 			 (@wk_01_end_date ... @wk_12_end_date) using @thru_date.  Because this is no longer a rolling 
+-- 			 12 weeks, it is now the calendar year, the code was modified to first calculate the
+-- 			 @wk_01_beg_date.  If there are less than 12 weeks of data, than @wk_01_beg_date is the first
+-- 			 day of the calendar year and the 12 wk end dates are calculated from the @wk_01_beg_date. If
+-- 			 there are at least 12 weeks of data, than calculate the @wk_01_beg_date using the @thru_date.
+-- 			 Note that if the @thru_date is the last day of the calendar year, calculation adjusts for this. 
+-- 			 It is calculated using the @thru_date. 
+
+-- removed 06/14/2022					
+--				SET @wk_01_end_date := DATE_SUB(@thru_date,INTERVAL 11 WEEK);
+--				SET @wk_02_end_date := DATE_SUB(@thru_date,INTERVAL 10 WEEK);	
+--				SET @wk_03_end_date := DATE_SUB(@thru_date,INTERVAL 09 WEEK);	
+--				SET @wk_04_end_date := DATE_SUB(@thru_date,INTERVAL 08 WEEK);
+--				SET @wk_05_end_date := DATE_SUB(@thru_date,INTERVAL 07 WEEK);
+--				SET @wk_06_end_date := DATE_SUB(@thru_date,INTERVAL 06 WEEK);
+--				SET @wk_07_end_date := DATE_SUB(@thru_date,INTERVAL 05 WEEK);
+--				SET @wk_08_end_date := DATE_SUB(@thru_date,INTERVAL 04 WEEK);
+--				SET @wk_09_end_date := DATE_SUB(@thru_date,INTERVAL 03 WEEK);
+--				SET @wk_10_end_date := DATE_SUB(@thru_date,INTERVAL 02 WEEK);
+--				SET @wk_11_end_date := DATE_SUB(@thru_date,INTERVAL 01 WEEK);
+--				SET @wk_12_end_date := @thru_date;	
+-- 
+--				
+--				SET @wk_01_beg_date := DATE_SUB(@wk_01_end_date,INTERVAL 6 DAY);
+-- 
+
+-- added 06/14/2022
+				SET @wk_01_end_date := 
+						CASE
+							WHEN YEAR(DATE_SUB(@beg_date_of_thru_wk,INTERVAL 11 WEEK)) <> YEAR(@thru_date)
+							THEN				
+								CASE WHEN DAYNAME(@from_date) = 'Monday' THEN DATE_ADD(@from_date,INTERVAL 6 DAY) ELSE
+								CASE WHEN DAYNAME(@from_date) = 'Tuesday' THEN DATE_ADD(@from_date,INTERVAL 5 DAY) ELSE
+								CASE WHEN DAYNAME(@from_date) = 'Wednesday' THEN DATE_ADD(@from_date,INTERVAL 4 DAY) ELSE		
+								CASE WHEN DAYNAME(@from_date) = 'Thursday' THEN DATE_ADD(@from_date,INTERVAL 3 DAY) ELSE
+								CASE WHEN DAYNAME(@from_date) = 'Friday' THEN DATE_ADD(@from_date,INTERVAL 2 DAY) ELSE
+								CASE WHEN DAYNAME(@from_date) = 'Saturday' THEN DATE_ADD(@from_date,INTERVAL 1 DAY) ELSE @from_date
+								END END END END END END
+							ELSE DATE_ADD(DATE_SUB(@beg_date_of_thru_wk,INTERVAL 11 WEEK),INTERVAL 6 DAY)
+						END;				
+				
+-- added 06/14/2022
+				SET @wk_01_beg_date := 
+						CASE
+						  WHEN YEAR(DATE_SUB(@beg_date_of_thru_wk,INTERVAL 11 WEEK)) <> YEAR(@thru_date)
+						  THEN @from_date	
+						  ELSE DATE_SUB(@wk_01_end_date,INTERVAL 6 DAY)
+						END;		
+
+				SET @wk_02_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 1 WEEK);
+				SET @wk_03_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 2 WEEK);
+				SET @wk_04_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 3 WEEK);
+				SET @wk_05_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 4 WEEK);
+				SET @wk_06_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 5 WEEK);
+				SET @wk_07_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 6 WEEK);
+				SET @wk_08_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 7 WEEK);
+				SET @wk_09_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 8 WEEK);
+				SET @wk_10_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 9 WEEK);
+				SET @wk_11_end_date := DATE_ADD(@wk_01_end_date,INTERVAL 10 WEEK);
+				
+				SET @wk_12_end_date := 
+						CASE
+						  WHEN YEAR(@thru_date) <> YEAR(@work_thru_date)
+						  THEN @thru_date	
+						  ELSE DATE_ADD(@wk_01_end_date,INTERVAL 11 WEEK)
+						END;					
+
+-- --------------------------------------------------------------------------------------------		
+
+				SET @wk_01_yyyy_wk := CONCAT(DATE_FORMAT(@wk_01_end_date,'%Y-'),LPAD(WEEK(@wk_01_end_date,5),2,'00'));
+				SET @wk_02_yyyy_wk := CONCAT(DATE_FORMAT(@wk_02_end_date,'%Y-'),LPAD(WEEK(@wk_02_end_date,5),2,'00'));
+				SET @wk_03_yyyy_wk := CONCAT(DATE_FORMAT(@wk_03_end_date,'%Y-'),LPAD(WEEK(@wk_03_end_date,5),2,'00'));
+				SET @wk_04_yyyy_wk := CONCAT(DATE_FORMAT(@wk_04_end_date,'%Y-'),LPAD(WEEK(@wk_04_end_date,5),2,'00'));
+				SET @wk_05_yyyy_wk := CONCAT(DATE_FORMAT(@wk_05_end_date,'%Y-'),LPAD(WEEK(@wk_05_end_date,5),2,'00'));
+				SET @wk_06_yyyy_wk := CONCAT(DATE_FORMAT(@wk_06_end_date,'%Y-'),LPAD(WEEK(@wk_06_end_date,5),2,'00'));
+				SET @wk_07_yyyy_wk := CONCAT(DATE_FORMAT(@wk_07_end_date,'%Y-'),LPAD(WEEK(@wk_07_end_date,5),2,'00'));
+				SET @wk_08_yyyy_wk := CONCAT(DATE_FORMAT(@wk_08_end_date,'%Y-'),LPAD(WEEK(@wk_08_end_date,5),2,'00'));
+				SET @wk_09_yyyy_wk := CONCAT(DATE_FORMAT(@wk_09_end_date,'%Y-'),LPAD(WEEK(@wk_09_end_date,5),2,'00'));
+				SET @wk_10_yyyy_wk := CONCAT(DATE_FORMAT(@wk_10_end_date,'%Y-'),LPAD(WEEK(@wk_10_end_date,5),2,'00'));
+				SET @wk_11_yyyy_wk := CONCAT(DATE_FORMAT(@wk_11_end_date,'%Y-'),LPAD(WEEK(@wk_11_end_date,5),2,'00'));
+				SET @wk_12_yyyy_wk := CONCAT(DATE_FORMAT(@wk_12_end_date,'%Y-'),LPAD(WEEK(@wk_12_end_date,5),2,'00'));
+
+			-- ============================================================================================
+			-- Populate the KM_time_frame table with all the time periods reported in Key Measures.  
+			-- This table will be used later when user's want to pull up the available KM reporting.  
+			-- The yyyy-mm report header and the mmm column header underneath each section will be
+			-- populated from this table (further down in this procedure).
+			-- ============================================================================================
+			
+				TRUNCATE TABLE bevy.client_KM_time_frames;
+				
+				INSERT INTO bevy.client_KM_time_frames
+				VALUES
+
+							-- record 1 of 4 records
+							( 	NULL,
+								@from_date,
+								@thru_date,
+								'yyyy-mm', 
+								@mth_01_yyyy_mm,
+								@mth_02_yyyy_mm,
+								@mth_03_yyyy_mm,
+								@mth_04_yyyy_mm,
+								@mth_05_yyyy_mm,
+								@mth_06_yyyy_mm,
+								@mth_07_yyyy_mm,
+								@mth_08_yyyy_mm,
+								@mth_09_yyyy_mm,
+								@mth_10_yyyy_mm,
+								@mth_11_yyyy_mm,
+								@mth_12_yyyy_mm
+							),
+											
+							-- record 2 of 4 records
+							( 	NULL,
+								@from_date,
+								@thru_date,
+								'mmm', 
+								@mth_01_mmm,
+								@mth_02_mmm,
+								@mth_03_mmm,
+								@mth_04_mmm,
+								@mth_05_mmm,
+								@mth_06_mmm,
+								@mth_07_mmm,
+								@mth_08_mmm,
+								@mth_09_mmm,
+								@mth_10_mmm,
+								@mth_11_mmm,
+								@mth_12_mmm
+							),			
+
+							-- record 3 of 4 records
+							( 	NULL,
+								@wk_01_beg_date,
+								@thru_date,
+								'yyyy-wk', 
+								@wk_01_yyyy_wk,
+								@wk_02_yyyy_wk,
+								@wk_03_yyyy_wk,
+								@wk_04_yyyy_wk,
+								@wk_05_yyyy_wk,
+								@wk_06_yyyy_wk,
+								@wk_07_yyyy_wk,
+								@wk_08_yyyy_wk,
+								@wk_09_yyyy_wk,
+								@wk_10_yyyy_wk,
+								@wk_11_yyyy_wk,
+								@wk_12_yyyy_wk
+							),
+											
+							-- record 4 of 4 records
+							( 	NULL,
+								@wk_01_beg_date,
+								@thru_date,
+								'wk', 
+								RIGHT(@wk_01_yyyy_wk,2),
+								RIGHT(@wk_02_yyyy_wk,2),
+								RIGHT(@wk_03_yyyy_wk,2),
+								RIGHT(@wk_04_yyyy_wk,2),
+								RIGHT(@wk_05_yyyy_wk,2),
+								RIGHT(@wk_06_yyyy_wk,2),
+								RIGHT(@wk_07_yyyy_wk,2),
+								RIGHT(@wk_08_yyyy_wk,2),
+								RIGHT(@wk_09_yyyy_wk,2),
+								RIGHT(@wk_10_yyyy_wk,2),
+								RIGHT(@wk_11_yyyy_wk,2),
+								RIGHT(@wk_12_yyyy_wk,2)
+							);
+
+			
+-- ============================================================================================	
+-- Step 2: Populate temporary table with survey summary counts (bevy.survey_dtl).  Then use 
+-- it to populate the summary table (bevy.client_KM_counts)
+-- ============================================================================================
+	
+			-- ============================================================================================
+			-- Populate temporary table (bevy.survey_dtl).
+			-- Select all surveys during time frame having a tech rating. 
+			-- ============================================================================================
+						
+				DROP TEMPORARY TABLE IF EXISTS bevy.survey_dtl;
+						
+			
+				CREATE TEMPORARY TABLE bevy.survey_dtl
+																		(  client_id 						INT,
+																			yyyy_mm							CHAR(7),
+																			yyyy_wk							CHAR(7),
+																			superzone_id					INT,
+																			service_order_id 				INT,
+																			high_tech_score_rating		INT
+																		);
+							
+				INSERT INTO bevy.survey_dtl
+						
+				SELECT   
+							s.client_id,
+										
+							@yyyy_mm :=
+											CASE
+											WHEN zip.time_zone IS NOT NULL
+											THEN DATE_FORMAT(CONVERT_TZ(srvy.created_at,'UTC',zip.time_zone),'%Y-%m')
+											ELSE DATE_FORMAT(CONVERT_TZ(srvy.created_at,'UTC','US/Eastern'),'%Y-%m')
+											END,
+													
+							@yyyy_wk :=
+											CASE
+									 		WHEN zip.time_zone IS NOT NULL
+									 		THEN CONCAT(DATE_FORMAT(CONVERT_TZ(srvy.created_at,'UTC',zip.time_zone),'%Y'),'-',
+									 						LPAD(WEEK(DATE(CONVERT_TZ(srvy.created_at,'UTC',zip.time_zone)),5),2,'00'))		        
+							       		ELSE CONCAT(DATE_FORMAT(CONVERT_TZ(srvy.created_at,'UTC','US/Eastern'),'%Y'),'-',
+							       						LPAD(WEEK(DATE(CONVERT_TZ(srvy.created_at,'UTC','US/Eastern')),5),2,'00'))
+									 		END,
+			
+					 		z.superzone_id,
+					 		
+					 		s.id,
+													
+							CASE
+							WHEN (srvy.template_id = 3 AND template3_tech_rating.answer >= 4)
+							  OR (srvy.template_id = 4 AND template4_tech_rating.answer >= 8)
+							THEN 1
+							ELSE 0
+							END	
+										
+							
+				FROM 	
+						surveys srvy
+													
+						   	LEFT JOIN survey_responses template3_tech_rating
+					         ON srvy.id = template3_tech_rating.survey_id
+					         AND template3_tech_rating.question_id = 3
+					           
+								   	LEFT JOIN survey_responses template4_tech_rating
+								      ON srvy.id = template4_tech_rating.survey_id
+								      AND template4_tech_rating.question_id = 13,
+						            
+				      appointments a,
+						service_orders s,
+						zones z,
+						customers c,
+						locations l,
+						zipcodes zip
+			 			         
+				WHERE 
+						
+							  	( 	  (    zip.time_zone IS NOT NULL 
+										AND DATE(CONVERT_TZ(srvy.created_at,'UTC',zip.time_zone)) >= @from_date 
+										AND DATE(CONVERT_TZ(srvy.created_at,'UTC',zip.time_zone)) <= @thru_date
+									  )
+								  OR
+									  (    zip.time_zone IS NULL 
+										AND DATE(CONVERT_TZ(srvy.created_at,'UTC','US/Eastern')) >= @from_date 
+										AND DATE(CONVERT_TZ(srvy.created_at,'UTC','US/Eastern')) <= @thru_date
+									  )					
+							 	)
+									 
+						AND	(    (srvy.template_id = 3 AND template3_tech_rating.answer IS NOT NULL) 
+								  OR (srvy.template_id = 4 AND template4_tech_rating.answer IS NOT NULL)
+								)   
+						
+						AND srvy.appointment_id = a.id	
+						AND a.service_order_id = s.id	
+						AND s.zone_id = z.id	
+						AND s.customer_id = c.id
+						AND c.location_id = l.id
+						AND l.zipcode = zip.code
+						
+				ORDER BY s.client_id, srvy.created_at,  z.superzone_id;
+			
+
+			-- ============================================================================================
+			-- Clear the summary table bevy.client_KM_counts.  Add survey counts (from the temporary table
+			-- created above) to the summary table.
+			-- ============================================================================================
+			
+				TRUNCATE TABLE bevy.client_KM_counts;
+				INSERT INTO bevy.client_KM_counts
+				SELECT NULL, dtl.client_id, dtl.yyyy_mm, dtl.yyyy_wk, dtl.superzone_id, 'nbr_of_surveys_with_a_tech_score_rating', COUNT(dtl.service_order_id)
+				FROM bevy.survey_dtl  dtl
+				GROUP BY dtl.client_id, dtl.yyyy_mm, dtl.yyyy_wk, dtl.superzone_id;
+				
+				INSERT INTO bevy.client_KM_counts
+				SELECT NULL, dtl.client_id, dtl.yyyy_mm, dtl.yyyy_wk, dtl.superzone_id, 'nbr_of_surveys_with_a_high_tech_score_rating', SUM(dtl.high_tech_score_rating)
+				FROM bevy.survey_dtl  dtl
+				GROUP BY dtl.client_id, dtl.yyyy_mm, dtl.yyyy_wk, dtl.superzone_id;				
+
+												
+-- ============================================================================================			
+-- Step 3: Populate temporary table with cancelled s.o. counts (bevy.cancelled_so).  Then use 
+-- it to populate the summary table (bevy.client_KM_counts)
+-- ============================================================================================	
+			
+				DROP TEMPORARY TABLE IF EXISTS bevy.cancelled_so;
+				
+			
+				CREATE TEMPORARY TABLE bevy.cancelled_so
+																		(  client_id 					INT,
+																			yyyy_mm						CHAR(7),
+																			yyyy_wk						CHAR(7),
+																			superzone_id				INT,
+																			service_order_id			INT         
+																		);
+			
+				INSERT INTO bevy.cancelled_so
+													
+				SELECT 
+							s.client_id,
+							DATE_FORMAT(CONVERT_TZ(can.created_at,'UTC','US/Eastern'),'%Y-%m'),
+							CONCAT(DATE_FORMAT(CONVERT_TZ(can.created_at,'UTC','US/Eastern'),'%Y'),'-',LPAD(WEEK(DATE(CONVERT_TZ(can.created_at,'UTC','US/Eastern')),5),2,'00')),  
+							z.superzone_id,
+							s.id
+										
+				FROM cancellations can,
+					  service_orders s
+					  		LEFT JOIN zones z
+					  		ON z.id = s.zone_id
+								  
+				WHERE DATE(CONVERT_TZ(can.created_at,'UTC','US/Eastern')) >= @from_date
+				  AND DATE(CONVERT_TZ(can.created_at,'UTC','US/Eastern')) <= @thru_date
+				  AND can.id = s.cancellation_id
+					  
+				ORDER BY s.client_id, z.superzone_id, can.created_at;
+			
+
+			-- ============================================================================================
+			-- Summarize the data from the temporary table and put it into the bevy.client_KM_counts 
+			-- summary table.
+			-- ============================================================================================
+
+				INSERT INTO bevy.client_KM_counts
+				SELECT NULL, dtl.client_id, dtl.yyyy_mm, dtl.yyyy_wk, dtl.superzone_id, 'nbr_of_cancelled_service_orders', COUNT(dtl.service_order_id)
+				FROM bevy.cancelled_so dtl
+				GROUP BY dtl.client_id, dtl.yyyy_mm, dtl.yyyy_wk, dtl.superzone_id;
+
+
+-- 06/14/22 added Step 4 (and renumbered subsequent steps).  
+-- 
+-- ============================================================================================				
+-- Step 4: Create table holding appointments with mult tech reports (in error)
+-- ============================================================================================		 
+
+				DROP TEMPORARY TABLE IF EXISTS bevy.appts_having_mult_tech_rpts;
+						
+			
+				CREATE TEMPORARY TABLE bevy.appts_having_mult_tech_rpts
+																		(  appointment_id						INT,
+																		   latest_tr_update_timestamp   	TIMESTAMP
+																		);
+							
+				INSERT INTO bevy.appts_having_mult_tech_rpts
+						
+				SELECT a.id, MAX(tr.updated_at)
+
+				FROM 
+						routes r
+			
+							LEFT JOIN appointments a
+							ON r.id = a.route_id
+							AND a.cancellation_id IS NULL
+							AND a.pickup <> 1
+							
+								LEFT JOIN tech_reports tr
+								ON a.id = tr.reportable_id
+								AND tr.reportable_type = 'Appointment'
+
+				WHERE 
+							
+						  		r.date >= @from_date
+						  AND r.date <= @thru_date		
+  						  AND r.cancellation_id IS NULL
+    					  AND (SELECT count(tr2.reportable_id)
+  						  		 FROM tech_reports tr2
+								 WHERE a.id = tr2.reportable_id
+								   AND tr2.reportable_type = 'Appointment') > 1
+									  
+				GROUP BY a.id;
+									
+
+-- ============================================================================================				
+-- Step 5: Populate temporary table with s.o. outcomes summary data (bevy.so_outcomes).  Then
+-- summarize the data from the temporary table to populate the summary table.
+-- ============================================================================================		
+	 					
+						-- ============================================================================================
+						-- Populate temporary table bevy.so_outcomes
+						-- Select all s.o.'s whose tech reports were created during time frame.  Derive response 
+						-- times (i.e. s.o. created to s.o. serviced).  Pull outcomes.  Determine completion and 
+						-- FTC status'.
+						-- 
+						-- Maintenance:
+						-- 06/14/2022: Added fields (Response Time ranges, mattress inspection totals & totals excl
+						-- 				mattress inspections along with calc fields to reduce # calls to same fn
+						-- ============================================================================================
+			
+							-- For readability the following fields were created as holding fields for every field 
+							-- in the new record.  Its name matches the field name in the table's record layout except 
+							-- it begins with @x_ and the fields are in the same order as in the table record.
+							
+							SET @x_client_id																					:= NULL;
+							SET @x_service_order_created_at																:= NULL;
+							SET @x_service_date 																				:= NULL;
+							SET @x_yyyy_mm																						:= NULL;
+							SET @x_yyyy_wk																						:= NULL;
+							SET @x_superzone_id																				:= NULL;
+							SET @x_service_order_id																			:= NULL;
+							
+			-- SECT 2
+							SET @x_preferred_max_nbr_of_days																:= NULL;
+							SET @x_nbr_of_scheduled_service_orders														:= NULL;
+--							SET @x_nbr_serviced_within_preferred_max_nbr_of_days									:= NULL;		-- removed 06/14/2022
+--							SET @x_nbr_serviced_outside_preferred_max_nbr_of_days									:= NULL;		-- removed 06/14/2022
+							SET @x_lead_time_minus_SAW_holidays															:= NULL;		-- added 06/14/2022	
+							SET @x_nbr_serviced_between_01_and_05_days												:= NULL;		-- added 06/14/2022
+							SET @x_nbr_serviced_between_06_and_10_days												:= NULL;		-- added 06/14/2022		
+							SET @x_nbr_serviced_between_11_and_15_days												:= NULL;		-- added 06/14/2022
+							SET @x_nbr_serviced_in_16_plus_days															:= NULL;		-- added 06/14/2022					
+							
+			-- SECT 3	
+							SET @x_nbr_of_scheduled_service_orders2													:= NULL;	
+							SET @x_does_scheduled_so_have_matt_insp													:= NULL;		-- added 06/14/2022
+							SET @x_nbr_of_scheduled_service_orders2_matt_insp										:= NULL;		-- added 06/14/2022	
+							SET @x_nbr_of_scheduled_service_orders2_excl_matt_insp 								:= NULL;		-- added 06/14/2022								
+							SET @x_nbr_of_so_with_outcome_complete														:= NULL;
+							SET @x_does_complete_so_have_complete_matt_insp											:= NULL;		-- added 06/14/2022
+							SET @x_nbr_of_so_with_outcome_complete_matt_insp										:= NULL;		-- added 06/14/2022	
+							SET @x_nbr_of_so_with_outcome_complete_excl_matt_insp									:= NULL;		-- added 06/14/2022											
+							SET @x_nbr_of_so_with_outcome_incomplete													:= NULL;
+							SET @x_nbr_of_so_with_outcome_NAH															:= NULL;
+							SET @x_nbr_of_so_with_outcome_other															:= NULL;
+							SET @x_nbr_of_eligible_so_compl																:= NULL;			
+							SET @x_nbr_of_eligible_so_compl_matt_insp													:= NULL;		-- added 06/14/2022
+							SET @x_nbr_of_eligible_so_compl_excl_matt_insp											:= NULL;		-- added 06/14/2022							
+							
+			-- SECT 5	
+							SET @x_nbr_of_scheduled_service_orders3													:= NULL;			
+							SET @x_nbr_of_so_ineligible_FTC																:= NULL;
+							SET @x_nbr_of_so_eligible_FTC																	:= NULL;
+							SET @x_nbr_of_so_eligible_FTC_outcome_NAH													:= NULL;
+							SET @x_nbr_of_so_eligible_FTC_at_home														:= NULL;
+							SET @x_nbr_of_so_eligible_FTC_at_home_matt_insp											:= NULL;		-- added 06/14/2022
+							SET @x_nbr_of_so_eligible_FTC_at_home_excl_matt_insp									:= NULL;		-- added 06/14/2022
+							SET @x_nbr_of_so_eligible_FTC_at_home_outcome_complete								:= NULL;
+							SET @x_nbr_of_so_elig_FTC_at_home_outcome_complete_matt_insp						:= NULL;		-- added 06/14/2022
+							SET @x_nbr_of_so_elig_FTC_at_home_outcome_complete_excl_matt_insp					:= NULL;		-- added 06/14/2022
+							SET @x_nbr_of_so_eligible_FTC_at_home_outcome_incomplete								:= NULL;
+							SET @x_nbr_of_so_eligible_FTC_at_home_outcome_other									:= NULL;
+
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz							
+
+			-- SECT 6
+							SET @x_does_so_have_complete_outcome_and_complete_issue								:= NULL;		-- added 06/14/2022
+							SET @x_so_has_complete_issues_with_complete_successful_outcome						:= NULL;
+							SET @x_so_has_complete_issues_with_complete_successful_outcome_mi					:= NULL;		-- added 06/14/2022
+							SET @x_so_has_complete_issues_with_complete_successful_outcome_ex_mi				:= NULL;		-- added 06/14/2022
+							SET @x_so_has_complete_issues_with_customer_refused_outcome							:= NULL;
+							SET @x_so_has_complete_issues_with_no_service_needed_outcome						:= NULL;
+							SET @x_so_has_complete_issues_with_not_covered_by_warranty_outcome				:= NULL;
+							SET @x_so_has_complete_issues_with_wrong_parts_sent_outcome							:= NULL;
+							SET @x_so_has_incomplete_issues_with_exchange_outcome									:= NULL;
+							SET @x_so_has_incomplete_issues_with_more_time_needed_outcome						:= NULL;
+							SET @x_so_has_incomplete_issues_with_parts_required_outcome							:= NULL;
+							SET @x_so_has_incomplete_issues_with_cleaning_not_performed_outcome				:= NULL;
+							SET @x_so_has_incomplete_issues_with_unsuccessful_cleaning_outcome				:= NULL;
+							SET @x_so_has_incomplete_issues_with_incomp_mattress_inspect_outcome				:= NULL;
+							
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+			 
+							SET @x_outcome_NAH2																				:= NULL;
+			
+			-- SECT 7
+							SET @x_nbr_of_scheduled_service_orders4													:= NULL;
+							SET @x_nbr_of_scheduled_service_orders4_matt_insp										:= NULL;		-- added 06/14/2022	
+							SET @x_nbr_of_scheduled_service_orders4_excl_matt_insp								:= NULL;		-- added 06/14/2022
+			
+			-- SECT 8
+							SET @x_does_so_have_a_client_review_report												:= NULL;		-- added 06/14/2022	
+							SET @x_so_has_a_client_review_report 														:= NULL;
+							SET @x_does_crr_have_parts_req																:= NULL;		-- added 06/14/2022	
+							SET @x_so_has_a_client_review_report_with_parts_req 									:= NULL;
+							SET @x_so_has_a_client_review_report_without_parts_req 								:= NULL;
+							SET @x_so_has_parts_req_notice_in_outcome_rpt_or_CRR						 			:=	NULL;	
+							SET @x_so_rescheduled																			:= NULL;																					
+			
+			
+							DROP TEMPORARY TABLE IF EXISTS bevy.so_outcomes;
+						
+			
+							CREATE TEMPORARY TABLE bevy.so_outcomes
+									(  client_id 																					INT,
+										service_order_created_at																DATE,
+										service_date																				DATE,
+										yyyy_mm																						CHAR(7),
+										yyyy_wk																						CHAR(7),
+										superzone_id																				INT,
+										service_order_id																			INT,
+			-- SECT 2
+										preferred_max_nbr_of_days																INT,
+										nbr_of_scheduled_service_orders														INT,
+--										nbr_serviced_within_preferred_max_nbr_of_days									INT,		-- removed 06/14/2022
+--										nbr_serviced_outside_preferred_max_nbr_of_days									INT,		-- removed 06/14/2022
+										lead_time_minus_SAW_holidays															INT,		-- added 06/14/2022
+										nbr_serviced_between_01_and_05_days													INT,		-- added 06/14/2022
+										nbr_serviced_between_06_and_10_days													INT,		-- added 06/14/2022
+										nbr_serviced_between_11_and_15_days													INT,		-- added 06/14/2022
+										nbr_serviced_in_16_plus_days															INT,		-- added 06/14/2022
+			-- SECT 3
+										nbr_of_scheduled_service_orders2														INT,
+										does_scheduled_so_have_matt_insp														INT,		-- added 06/14/2022
+										nbr_of_scheduled_service_orders2_matt_insp										INT,		-- added 06/14/2022
+										nbr_of_scheduled_service_orders2_excl_matt_insp									INT,		-- added 06/14/2022
+										nbr_of_so_with_outcome_complete														INT,
+										does_complete_so_have_complete_matt_insp											INT,		-- added 06/14/2022
+										nbr_of_so_with_outcome_complete_matt_insp											INT,		-- added 06/14/2022
+										nbr_of_so_with_outcome_complete_excl_matt_insp									INT,		-- added 06/14/2022
+										nbr_of_so_with_outcome_incomplete													INT,
+										nbr_of_so_with_outcome_NAH				 												INT,
+										nbr_of_so_with_outcome_other															INT,
+										nbr_of_eligible_so_compl																INT,
+										nbr_of_eligible_so_compl_matt_insp													INT,		-- added 06/14/2022
+										nbr_of_eligible_so_compl_excl_matt_insp											INT,		-- added 06/14/2022
+			-- SECT 5
+										nbr_of_scheduled_service_orders3														INT,
+										nbr_of_so_ineligible_FTC																INT,
+										nbr_of_so_eligible_FTC																	INT,
+										nbr_of_so_eligible_FTC_outcome_NAH 													INT,
+										nbr_of_so_eligible_FTC_at_home														INT,
+										nbr_of_so_eligible_FTC_at_home_matt_insp											INT,		-- added 06/14/2022
+										nbr_of_so_eligible_FTC_at_home_excl_matt_insp									INT,		-- added 06/14/2022
+										nbr_of_so_eligible_FTC_at_home_outcome_complete 								INT,
+										nbr_of_so_elig_FTC_at_home_outcome_complete_matt_insp							INT,		-- added 06/14/2022
+										nbr_of_so_elig_FTC_at_home_outcome_complete_excl_matt_insp					INT,		-- added 06/14/2022
+										nbr_of_so_eligible_FTC_at_home_outcome_incomplete 								INT,
+										nbr_of_so_eligible_FTC_at_home_outcome_other 									INT,
+
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+			-- SECT 6
+										does_so_have_complete_outcome_and_complete_issue								INT,		-- added 06/14/2022
+										so_has_complete_issues_with_complete_successful_outcome						INT,
+										so_has_complete_issues_with_complete_successful_outcome_mi					INT,		-- added 06/14/2022
+										so_has_complete_issues_with_complete_successful_outcome_ex_mi				INT,		-- added 06/14/2022
+										so_has_complete_issues_with_customer_refused_outcome							INT,
+										so_has_complete_issues_with_no_service_needed_outcome							INT,
+										so_has_complete_issues_with_not_covered_by_warranty_outcome					INT,
+										so_has_complete_issues_with_wrong_parts_sent_outcome							INT,
+										so_has_incomplete_issues_with_exchange_outcome									INT,
+										so_has_incomplete_issues_with_more_time_needed_outcome						INT,
+										so_has_incomplete_issues_with_parts_required_outcome							INT,
+										so_has_incomplete_issues_with_cleaning_not_performed_outcome				INT,
+										so_has_incomplete_issues_with_unsuccessful_cleaning_outcome					INT,
+										so_has_incomplete_issues_with_incomp_mattress_inspect_outcome				INT,
+
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz	
+			
+										nbr_of_so_with_outcome_NAH2															INT,
+										
+			-- SECT 7
+										nbr_of_scheduled_service_orders4														INT,
+										nbr_of_scheduled_service_orders4_matt_insp										INT,		-- added 06/14/2022
+										nbr_of_scheduled_service_orders4_excl_matt_insp									INT,		-- added 06/14/2022
+										
+			-- SECT 8
+										does_so_have_a_client_review_report													INT,		-- added 06/14/2022	
+										so_has_a_client_review_report 														INT,
+										oes_crr_have_parts_req																	INT,		-- added 06/14/2022
+										so_has_a_client_review_report_with_parts_req										INT,
+										so_has_a_client_review_report_without_parts_req									INT,
+										so_has_parts_req_notice_in_outcome_rpt_or_CRR									INT,																			
+										so_rescheduled																				INT
+										
+									);
+			
+							INSERT INTO bevy.so_outcomes 
+													
+							SELECT   @x_client_id														:= s.client_id,
+										@x_service_order_created_at									:= DATE(CONVERT_TZ(s.created_at,'UTC', 'US/Eastern')),
+										@x_service_date_and_time										:= DATE(CONVERT_TZ(tr.time_out,'UTC', 'US/Eastern')),							
+										@x_yyyy_mm															:= DATE_FORMAT(@x_service_date_and_time,'%Y-%m'),
+										@x_yyyy_wk															:= CONCAT(DATE_FORMAT(@x_service_date_and_time,'%Y-'),LPAD(WEEK(@x_service_date_and_time,5),2,'00')),
+										@x_superzone_id													:= z.superzone_id,
+										@x_service_order_id												:= s.id,
+			-- SECT 2
+										@x_preferred_max_nbr_of_days									:= c.lead_time_threshold,
+										@x_nbr_of_scheduled_service_orders							:= 1,
+										
+										-- removed 06/14/2022
+--										@x_nbr_serviced_within_preferred_max_nbr_of_days 		:= CASE 
+--																													WHEN sf_calc_lead_time_minus_SAW_holidays(@x_service_order_created_at,@x_service_date_and_time) 
+-- 																														<= c.lead_time_threshold 
+--																													THEN 1 
+--																													ELSE 0 
+--																													END,
+
+										-- removed 06/14/2022																													
+--										@x_nbr_serviced_outside_preferred_max_nbr_of_days 		:= CASE 
+--																													WHEN sf_calc_lead_time_minus_SAW_holidays(@x_service_order_created_at,@x_service_date_and_time) 
+-- 																														> c.lead_time_threshold  
+-- 																												THEN 1 
+-- 																												ELSE 0 
+-- 																												END,
+-- 									---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+										-- added 06/14/2022
+										@x_lead_time_minus_SAW_holidays								:= ROUND(sf_calc_lead_time_minus_SAW_holidays(@x_service_order_created_at,@x_service_date_and_time),0),
+																			
+
+										-- added 06/14/2022
+										@x_nbr_serviced_between_01_and_05_days			 			:= CASE 
+																													WHEN @x_lead_time_minus_SAW_holidays <= 5 
+																													THEN 1 
+																													ELSE 0 
+																													END,
+
+										-- added 06/14/2022																													
+										@x_nbr_serviced_between_06_and_10_days 					:= CASE 
+																													WHEN @x_lead_time_minus_SAW_holidays > 5  
+																													 AND @x_lead_time_minus_SAW_holidays <= 10 
+																													THEN 1 
+																													ELSE 0
+																													END,
+
+										-- added 06/14/2022																													
+										@x_nbr_serviced_between_11_and_15_days 					:= CASE 
+																													WHEN @x_lead_time_minus_SAW_holidays > 10 
+																													 AND @x_lead_time_minus_SAW_holidays <= 15 
+																													THEN 1 
+																													ELSE 0 
+																													END,
+
+										-- added 06/14/2022																													
+										@x_nbr_serviced_in_16_plus_days			 					:= CASE 
+																													WHEN @x_lead_time_minus_SAW_holidays > 15  
+																													THEN 1 
+																													ELSE 0 
+																													END,
+
+-- 									---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+			-- SECT 3
+										@x_nbr_of_scheduled_service_orders2							:= 1,
+
+										-- added 06/14/2022
+										@x_does_scheduled_so_have_matt_insp							:= CASE 
+																													WHEN sf_get_count_of_outcomes_from_mattress_rpts(1,tr.id,0) > 0 
+																													THEN 1 
+																													ELSE 0 
+																													END,
+								
+										-- added 06/14/2022
+										@x_nbr_of_scheduled_service_orders2_matt_insp			:= CASE 
+																													WHEN @x_does_scheduled_so_have_matt_insp = 1 
+																													THEN 1 
+																													ELSE 0 
+																													END,
+
+										-- added 06/14/2022																														
+										@x_nbr_of_scheduled_service_orders2_excl_matt_insp		:= CASE 
+																													WHEN @x_does_scheduled_so_have_matt_insp = 0 
+																													THEN 1 
+																													ELSE 0 
+																													END,
+																																
+										@x_nbr_of_so_with_outcome_complete							:= CASE WHEN tr.outcome = 'Complete' OR tr.outcome = 'Done' THEN 1 ELSE 0 END,
+											
+										-- added 06/14/2022										
+										@x_does_complete_so_have_complete_matt_insp				:= CASE 
+																													WHEN (tr.outcome = 'Complete' OR tr.outcome = 'Done') 
+																													 AND sf_get_count_of_outcomes_from_mattress_rpts(1,tr.id,1) > 0  -- [parms: 1=tech report, tr.id=tech report id, 1=Complete Outcomes]
+																													THEN 1 
+																													ELSE 0 
+																													END,	
+																														
+										-- added 06/14/2022										
+										@x_nbr_of_so_with_outcome_complete_matt_insp				:= CASE 
+																													WHEN (tr.outcome = 'Complete' OR tr.outcome = 'Done')
+																													 AND @x_does_complete_so_have_complete_matt_insp = 1
+																													THEN 1 
+																													ELSE 0 
+																													END,	
+																														
+										-- added 06/14/2022																															
+										@x_nbr_of_so_with_outcome_complete_excl_matt_insp	 	:= CASE 
+																													WHEN (tr.outcome = 'Complete' OR tr.outcome = 'Done')
+																													 AND @x_does_complete_so_have_complete_matt_insp = 0 
+																													THEN 1
+																													ELSE 0 
+																													END,	
+																																
+										@x_nbr_of_so_with_outcome_incomplete						:= CASE WHEN tr.outcome = 'Incomplete' THEN 1 ELSE 0 END,
+										@x_nbr_of_so_with_outcome_NAH									:= CASE WHEN tr.outcome = 'Not At Home' THEN 1 ELSE 0 END,
+										@x_nbr_of_so_with_outcome_other								:= CASE WHEN tr.outcome = 'Partial' OR tr.outcome = 'Pending' OR tr.outcome = '' THEN 1 ELSE 0 END,
+										@x_nbr_of_eligible_so_compl									:= CASE WHEN tr.outcome <> 'Not At Home' THEN 1 ELSE 0 END,
+										@x_nbr_of_eligible_so_compl_matt_insp						:=	CASE 
+																													WHEN tr.outcome <> 'Not At Home' 
+																													 AND @x_does_complete_so_have_complete_matt_insp > 0 
+																													THEN 1 
+																													ELSE 0 
+																													END,										 
+										@x_nbr_of_eligible_so_compl_excl_matt_insp				:=	CASE 
+																													WHEN tr.outcome <> 'Not At Home' 
+																													 AND @x_does_complete_so_have_complete_matt_insp = 0 
+																													THEN 1 
+																													ELSE 0 
+																													END,											
+									
+			-- SECT 5
+										@x_nbr_of_scheduled_service_orders3							:= 1,
+										@x_nbr_of_so_ineligible_FTC									:= CASE WHEN s.episode <> 1 THEN 1 ELSE 0 END,	
+										@x_nbr_of_so_eligible_FTC										:= CASE WHEN s.episode = 1 THEN 1 ELSE 0 END,	
+										@x_nbr_of_so_eligible_FTC_outcome_NAH						:= CASE WHEN s.episode = 1 AND tr.outcome = 'Not At Home' THEN 1 ELSE 0 END,
+										@x_nbr_of_so_eligible_FTC_at_home							:= CASE WHEN s.episode = 1 AND tr.outcome <> 'Not At Home' THEN 1 ELSE 0 END,
+										
+										-- added 06/14/2022
+										@x_nbr_of_so_eligible_FTC_at_home_matt_insp		  		:= CASE 
+																													WHEN s.episode = 1 
+																													 AND tr.outcome <> 'Not At Home' 
+																													 AND @x_does_scheduled_so_have_matt_insp = 1
+																													THEN 1 
+																													ELSE 0 
+																													END,	
+																														
+										-- added 06/14/2022																														
+										@x_nbr_of_so_eligible_FTC_at_home_excl_matt_insp	 	:= CASE 
+																													WHEN s.episode = 1 
+																													 AND tr.outcome <> 'Not At Home' 
+																													 AND @x_does_scheduled_so_have_matt_insp = 0
+																													THEN 1 
+																													ELSE 0 
+																													END,	
+																																
+										@x_nbr_of_so_eligible_FTC_at_home_outcome_complete		:= CASE 
+																													WHEN s.episode = 1 
+																													 AND (tr.outcome = 'Complete' OR tr.outcome = 'Done') 
+																													THEN 1 
+																													ELSE 0 
+																													END,
+										
+										-- added 06/14/2022	
+										@x_nbr_of_so_elig_FTC_at_home_outcome_complete_matt_insp	:= CASE 
+																														WHEN s.episode = 1 
+																														 AND (tr.outcome = 'Complete' OR tr.outcome = 'Done') 
+																														 AND @x_does_complete_so_have_complete_matt_insp = 1
+																														THEN 1 
+																														ELSE 0 
+																														END,	
+										
+										-- added 06/14/2022																				
+										@x_nbr_of_so_elig_FTC_at_home_outcome_complete_excl_matt_insp	:= CASE 
+																																WHEN s.episode = 1
+																																 AND (tr.outcome = 'Complete' OR tr.outcome = 'Done')
+																																 AND @x_does_complete_so_have_complete_matt_insp = 0
+																																THEN 1 
+																																ELSE 0 
+																																END,	
+				
+										@x_nbr_of_so_eligible_FTC_at_home_outcome_incomplete	:= CASE 
+																													WHEN s.episode = 1 
+																													 AND tr.outcome = 'Incomplete' 
+																													THEN 1 
+																													ELSE 0 
+																													END,
+																													
+										@x_nbr_of_so_eligible_FTC_at_home_outcome_other			:= CASE 
+																													WHEN s.episode = 1
+																													 AND (tr.outcome = 'Partial' OR tr.outcome = 'Pending' OR tr.outcome = '') 
+																													THEN 1 
+																													ELSE 0 
+																													END,
+								
+			-- SECT 6
+
+										-- added 06/14/2022
+										@x_does_so_have_complete_outcome_and_complete_issue	:= CASE
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN (  sf_get_count_of_specific_outcome_from_mattress_rpts_for_so(tr.id,'Complete')
+																																+ sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so(tr.id,'Successful')
+																																+ sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'Complete') ) > 0    -- fixed on 06/14/2022
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,
+
+										-- 06/14/2022 modified
+										@x_so_has_complete_issues_with_complete_successful_outcome	:= 
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN @x_does_so_have_complete_outcome_and_complete_issue = 1
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,
+
+										-- added 06/14/2022
+										@x_so_has_complete_issues_with_complete_successful_outcome_mi	:= 
+																												CASE
+																												WHEN 	@x_does_so_have_complete_outcome_and_complete_issue = 1
+																												 AND @x_does_complete_so_have_complete_matt_insp = 1
+																												THEN 1
+																												ELSE 0
+																												END,
+
+										-- added 06/14/2022 
+										@x_so_has_complete_issues_with_complete_successful_outcome_ex_mi	:= 
+																												CASE
+																												WHEN 	@x_does_so_have_complete_outcome_and_complete_issue = 1
+																												 AND @x_does_complete_so_have_complete_matt_insp = 0
+																												THEN 1
+																												ELSE 0
+																												END,
+																														
+										@x_so_has_complete_issues_with_customer_refused_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'Customer Refused') > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,
+										
+										@x_so_has_complete_issues_with_no_service_needed_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'No Service Needed') > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,
+																											
+										@x_so_has_complete_issues_with_not_covered_by_warranty_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN (sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'Not Covered by Warranty') + 
+																														   sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so(tr.id,'Not Covered') ) > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,
+										
+										@x_so_has_complete_issues_with_wrong_parts_sent_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'Wrong Parts Sent') > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,
+										
+										@x_so_has_incomplete_issues_with_exchange_outcome	:=
+																									 			CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'Exchange') > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,
+			
+										@x_so_has_incomplete_issues_with_more_time_needed_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'Need More Time') > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,																								
+										
+										@x_so_has_incomplete_issues_with_parts_required_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN ( sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'Parts Required') + 
+																															 sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so(tr.id,'Parts Required') ) > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,																								
+																	
+										@x_so_has_incomplete_issues_with_cleaning_not_performed_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so(tr.id,'Cleaning Not Performed') > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,
+																											
+										@x_so_has_incomplete_issues_with_unsuccessful_cleaning_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN (  sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so(tr.id,'Unsuccessful') 
+																															+ sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so(tr.id,'')
+																														  ) > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,																										
+										
+										@x_so_has_incomplete_issues_with_incomp_mattress_inspect_outcome	:=
+																												CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_specific_outcome_from_mattress_rpts_for_so(tr.id,'Incomplete') > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,	
+																																																				
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+			
+										@x_nbr_of_so_with_outcome_NAH2			 				:= CASE WHEN tr.outcome = 'Not At Home' THEN 1 ELSE 0 END,
+			
+			-- SECT 7
+										@x_nbr_of_scheduled_service_orders4						:= 1,
+										
+										-- added 06/14/2022
+										@x_nbr_of_scheduled_service_orders4_matt_insp		:= CASE
+																												WHEN @x_does_scheduled_so_have_matt_insp	= 1
+																															THEN 1 
+																												ELSE 0 
+																												END,
+																															
+										-- added 06/14/2022																						
+										@x_nbr_of_scheduled_service_orders4_excl_matt_insp	:=	CASE 
+																												WHEN @x_does_scheduled_so_have_matt_insp	= 0
+																												THEN 1 
+																												ELSE 0 
+																												END,
+			
+			-- SECT 8
+										-- added 06/14/2022
+										@x_does_so_have_a_client_review_report 				:=	CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_client_reviews_for_so(tr.id) > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,										
+
+										-- modified 06/14/2022									
+										@x_so_has_a_client_review_report 						:=	CASE
+																												WHEN @x_does_so_have_a_client_review_report = 1
+																												THEN 1
+																												ELSE 0
+																												END,
+																												
+										-- added 06/14/2022
+										@x_does_crr_have_parts_req									:= CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 0
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_client_review_rpts_with_parts_reqd_for_so(tr.id) > 0
+																													THEN 1
+																													ELSE 0
+																													END
+																												END,
+
+										-- modified 06/14/2022			
+										@x_so_has_a_client_review_report_with_parts_req	 	:= CASE
+																												WHEN @x_so_has_a_client_review_report = 1
+																												 AND @x_does_crr_have_parts_req = 1
+																												THEN 1
+																												ELSE 0
+																												END,
+
+										-- modified 06/14/2022																													
+										@x_so_has_a_client_review_report_without_parts_req := CASE
+																												WHEN @x_so_has_a_client_review_report = 1
+																												 AND @x_does_crr_have_parts_req = 0
+																												THEN 1
+																												ELSE 0
+																												END,
+
+										-- modified 06/14/2022
+										@x_so_has_parts_req_notice_in_outcome_rpt_or_CRR 	:=	CASE
+																												WHEN @x_so_has_incomplete_issues_with_parts_required_outcome = 1
+																												  OR @x_does_crr_have_parts_req = 1
+																												THEN 1
+																												ELSE 0
+																												END,	
+				
+										@x_so_rescheduled												:= CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 1
+																												ELSE
+																													CASE
+																													WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so(tr.id,'Need More Time') > 0
+																													THEN 1
+																													ELSE 0
+																													END
+
+ 																												END
+
+-- modified 06/14/2022
+							FROM 
+									routes r
+			
+										LEFT JOIN appointments a
+										ON r.id = a.route_id
+										AND a.cancellation_id IS NULL
+										AND a.pickup <> 1
+										
+											LEFT JOIN service_orders s
+											ON a.service_order_id = s.id
+											AND s.cancellation_id IS NULL
+																							  			
+												LEFT JOIN zones z
+												ON s.zone_id = z.id
+							
+												LEFT JOIN  clients c
+												ON s.client_id = c.id
+															
+											LEFT JOIN locations l
+											ON a.location_id = l.id
+													
+												LEFT JOIN zipcodes zip
+												ON l.zipcode = zip.code
+																	
+											LEFT JOIN tech_reports tr
+											ON a.id = tr.reportable_id
+											AND tr.reportable_type = 'Appointment'
+											
+											LEFT JOIN bevy.appts_having_mult_tech_rpts appt_with_mult_tech_rpts
+											ON a.id = appt_with_mult_tech_rpts.appointment_id
+																			  			
+							WHERE 
+							
+							  		r.date >= @from_date
+							  AND r.date <= @thru_date		
+  							  AND r.cancellation_id IS NULL
+  							  AND tr.id IS NOT NULL	
+  							  AND ( 		appt_with_mult_tech_rpts.appointment_id IS NULL
+  							  		  OR (    appt_with_mult_tech_rpts.appointment_id IS NOT NULL 
+  							  		  		AND tr.id = 
+															( SELECT MAX(latest_tr.id)
+															  FROM tech_reports latest_tr
+															  WHERE appt_with_mult_tech_rpts.appointment_id = latest_tr.reportable_id
+															    AND appt_with_mult_tech_rpts.latest_tr_update_timestamp = latest_tr.updated_at
+															    AND latest_tr.reportable_type = 'Appointment')
+											)
+									)
+							  
+							GROUP BY s.id;
+
+									
+			-- ============================================================================================
+			-- Summarize the data from the temporary table and put it into a summary table to 
+			-- be used for Key Measures reporting.
+			-- ============================================================================================
+ 
+ 			-- SECT 2
+			 				
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'preferred_max_nbr_of_days', MIN(preferred_max_nbr_of_days)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+							
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders', SUM(nbr_of_scheduled_service_orders)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;			
+
+							-- removed 06/14/2022
+--							INSERT INTO bevy.client_KM_counts
+--							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_serviced_within_preferred_max_nbr_of_days', SUM(nbr_serviced_within_preferred_max_nbr_of_days)
+--							FROM bevy.so_outcomes
+--							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;			
+
+							-- removed 06/14/2022
+--							INSERT INTO bevy.client_KM_counts
+--							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_serviced_outside_preferred_max_nbr_of_days', SUM(nbr_serviced_outside_preferred_max_nbr_of_days)
+--							FROM bevy.so_outcomes
+--							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_serviced_between_01_and_05_days', SUM(nbr_serviced_between_01_and_05_days)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;			
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_serviced_between_06_and_10_days', SUM(nbr_serviced_between_06_and_10_days)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;			
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_serviced_between_11_and_15_days', SUM(nbr_serviced_between_11_and_15_days)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;			
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_serviced_in_16_plus_days', SUM(nbr_serviced_in_16_plus_days)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;			
+							
+			-- SECT 3		
+										
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders2', SUM(nbr_of_scheduled_service_orders2)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders2_matt_insp', SUM(nbr_of_scheduled_service_orders2_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders2_excl_matt_insp', SUM(nbr_of_scheduled_service_orders2_excl_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+							
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_with_outcome_complete', SUM(nbr_of_so_with_outcome_complete)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;							
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_with_outcome_complete_matt_insp', SUM(nbr_of_so_with_outcome_complete_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_with_outcome_complete_excl_matt_insp', SUM(nbr_of_so_with_outcome_complete_excl_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_with_outcome_incomplete', SUM(nbr_of_so_with_outcome_incomplete)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+							
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_with_outcome_NAH', SUM(nbr_of_so_with_outcome_NAH)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_with_outcome_other', SUM(nbr_of_so_with_outcome_other)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_so_compl', SUM(nbr_of_eligible_so_compl)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_so_compl_matt_insp', SUM(nbr_of_eligible_so_compl_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_so_compl_excl_matt_insp', SUM(nbr_of_eligible_so_compl_excl_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+			-- SECT 5	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders3', SUM(nbr_of_scheduled_service_orders3)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_ineligible_FTC', SUM(nbr_of_so_ineligible_FTC)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_eligible_FTC', SUM(nbr_of_so_eligible_FTC)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_eligible_FTC_outcome_NAH', SUM(nbr_of_so_eligible_FTC_outcome_NAH)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_eligible_FTC_at_home', SUM(nbr_of_so_eligible_FTC_at_home)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_eligible_FTC_at_home_matt_insp', SUM(nbr_of_so_eligible_FTC_at_home_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_eligible_FTC_at_home_excl_matt_insp', SUM(nbr_of_so_eligible_FTC_at_home_excl_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_eligible_FTC_at_home_outcome_complete', SUM(nbr_of_so_eligible_FTC_at_home_outcome_complete)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_elig_FTC_at_home_outcome_complete_matt_insp', SUM(nbr_of_so_elig_FTC_at_home_outcome_complete_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_elig_FTC_at_home_outcome_complete_excl_matt_insp', SUM(nbr_of_so_elig_FTC_at_home_outcome_complete_excl_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_eligible_FTC_at_home_outcome_incomplete', SUM(nbr_of_so_eligible_FTC_at_home_outcome_incomplete)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_eligible_FTC_at_home_outcome_other', SUM(nbr_of_so_eligible_FTC_at_home_outcome_other)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+											
+			-- SECT 6
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_complete_issues_with_complete_successful_outcome', SUM(so_has_complete_issues_with_complete_successful_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_complete_issues_with_complete_successful_outcome_mi', SUM(so_has_complete_issues_with_complete_successful_outcome_mi)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_complete_issues_with_complete_successful_outcome_ex_mi', SUM(so_has_complete_issues_with_complete_successful_outcome_ex_mi)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+							
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_complete_issues_with_customer_refused_outcome', SUM(so_has_complete_issues_with_customer_refused_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+							
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_complete_issues_with_no_service_needed_outcome', SUM(so_has_complete_issues_with_no_service_needed_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_complete_issues_with_not_covered_by_warranty_outcome', SUM(so_has_complete_issues_with_not_covered_by_warranty_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_complete_issues_with_wrong_parts_sent_outcome', SUM(so_has_complete_issues_with_wrong_parts_sent_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_incomplete_issues_with_exchange_outcome', SUM(so_has_incomplete_issues_with_exchange_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_incomplete_issues_with_more_time_needed_outcome', SUM(so_has_incomplete_issues_with_more_time_needed_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_incomplete_issues_with_parts_required_outcome', SUM(so_has_incomplete_issues_with_parts_required_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_incomplete_issues_with_cleaning_not_performed_outcome', SUM(so_has_incomplete_issues_with_cleaning_not_performed_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_incomplete_issues_with_unsuccessful_cleaning_outcome', SUM(so_has_incomplete_issues_with_unsuccessful_cleaning_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_incomplete_issues_with_incomp_mattress_inspect_outcome', SUM(so_has_incomplete_issues_with_incomp_mattress_inspect_outcome)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+							
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_so_with_outcome_NAH2', SUM(nbr_of_so_with_outcome_NAH2)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+			
+			-- SECT 7										
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders4', SUM(nbr_of_scheduled_service_orders4)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders4_matt_insp', SUM(nbr_of_scheduled_service_orders4_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders4_excl_matt_insp', SUM(nbr_of_scheduled_service_orders4_excl_matt_insp)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+			
+			-- SECT 8
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_a_client_review_report', SUM(so_has_a_client_review_report)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+							
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_a_client_review_report_with_parts_req', SUM(so_has_a_client_review_report_with_parts_req)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+														
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_a_client_review_report_without_parts_req', SUM(so_has_a_client_review_report_without_parts_req)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_has_parts_req_notice_in_outcome_rpt_or_CRR', SUM(so_has_parts_req_notice_in_outcome_rpt_or_CRR)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'so_rescheduled', SUM(so_rescheduled)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;							
+															
+											
+-- added 06/14/2022 Step 5 {prev step 5 is now step 6}. 
+-- ============================================================================================				
+-- Step 5: Create table holding s.o. items having no outcome report (i.e. repair, mattress 
+-- 		  or cleaning)
+-- ============================================================================================		-- 
+-- 
+-- 
+
+				DROP TEMPORARY TABLE IF EXISTS bevy.items_missing_outcomes_rpt;
+						
+			
+				CREATE TEMPORARY TABLE bevy.items_missing_outcomes_rpt
+																		(  furniture_id 				INT NOT NULL,
+																			service_order_id			INT
+																		);
+							
+				INSERT INTO bevy.items_missing_outcomes_rpt
+						
+				SELECT   
+
+						f.id,
+						s.id
+
+				FROM 
+						routes r
+			
+							LEFT JOIN appointments a
+							ON r.id = a.route_id
+							AND a.cancellation_id IS NULL
+							AND a.pickup <> 1
+
+								LEFT JOIN tech_reports tr
+								ON a.id = tr.reportable_id
+								AND tr.reportable_type = 'Appointment'
+								AND tr.updated_at = 
+									( SELECT MAX(latest_tr.updated_at)
+									  FROM tech_reports latest_tr
+									  WHERE a.id = latest_tr.reportable_id
+									    AND latest_tr.reportable_type = 'Appointment')
+							
+								LEFT JOIN service_orders s
+								ON a.service_order_id = s.id
+								AND s.cancellation_id IS NULL
+																				  			
+							 		 LEFT JOIN furniture f
+						  	  		 ON s.id = f.service_order_id
+				  		  		 
+											LEFT JOIN furniture_reports fr
+											  ON tr.id = fr.tech_report_id
+										    AND f.id = fr.furniture_id
+															  			
+				WHERE 
+							
+						r.date >= @from_date
+				  AND r.date <= @thru_date		
+  				  AND r.cancellation_id IS NULL
+  				  AND tr.id IS NOT NULL
+  				  AND tr.outcome <> 'Not At Home'
+				  AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) +
+						sf_get_count_of_outcomes_from_cleaning_rpts(2,fr.id,0) +
+						sf_get_count_of_outcomes_from_repair_rpts(2,fr.id,0) = 0;
+							
+				
+-- ============================================================================================				
+-- Step 6: Populate temporary table with s.o. item outcomes summary data (bevy.item_outcomes).  
+-- Then summarize the data from the temporary table to populate the summary table.
+-- ============================================================================================					
+
+						-- ============================================================================================
+						-- Populate temporary table bevy.item_outcomes
+						-- Select all s.o. items whose tech reports were created during time frame.  Collect outcomes 
+						-- and root cause data for each item.  
+						-- 
+						-- Maintenance:
+						-- 06/14/2022: Added fields (Response Time ranges, mattress inspection totals & totals excl
+						-- 				mattress inspections
+						-- ============================================================================================
+			
+							-- For readability the following fields were created as holding fields for every field 
+							-- in the new record.  It's name matches the field name in the table's record layout except 
+							-- it begins with @x_ and the fields are in the same order as in the table record.
+							
+							SET @y_client_id																					:= NULL;
+							SET @y_yyyy_mm																						:= NULL;
+							SET @y_yyyy_wk																						:= NULL;
+							SET @y_superzone_id																				:= NULL;
+							SET @y_service_order_id																			:= NULL;
+							SET @y_furniture_id																				:= NULL;
+							
+			-- SECT 10
+--							SET @y_nbr_of_scheduled_service_orders														:= NULL;		-- removed 06/14/2022
+							SET @y_nbr_of_scheduled_pcs																	:= NULL;
+							SET @y_nbr_of_scheduled_pcs_matt_insp														:= NULL;		-- added 06/14/2022	
+							SET @y_nbr_of_scheduled_pcs_excl_matt_insp												:= NULL;		-- added 06/14/2022	
+							SET @y_nbr_of_complete_pcs																		:= NULL;
+							SET @y_nbr_of_complete_pcs_matt_insp														:= NULL;		-- added 06/14/2022	
+							SET @y_nbr_of_complete_pcs_excl_matt_insp													:= NULL;		-- added 06/14/2022								
+							SET @y_nbr_of_incomplete_pcs																	:= NULL;
+							SET @y_nbr_of_NAH_pcs																			:= NULL;
+							SET @y_nbr_of_eligible_complete_pcs															:= NULL;
+							SET @y_nbr_of_eligible_complete_pcs_matt_insp											:= NULL;		-- added 06/14/2022
+							SET @y_nbr_of_eligible_complete_pcs_excl_matt_insp										:= NULL;		-- added 06/14/2022
+							
+			-- SECT 11
+							SET @y_nbr_of_scheduled_pcs2																	:= NULL;
+							SET @y_nbr_of_ineligible_FTC_pcs																:= NULL;
+							SET @y_nbr_of_eligible_FTC_pcs																:= NULL;
+							SET @y_nbr_of_eligible_FTC_pcs_NAH															:= NULL;
+							SET @y_nbr_of_eligible_FTC_pcs_at_home														:= NULL;
+							SET @y_nbr_of_eligible_FTC_pcs_matt_insp													:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_eligible_FTC_pcs_excl_matt_insp											:= NULL;		-- added 06/14/2022	
+							SET @y_nbr_of_eligible_FTC_pcs_at_home_with_complete_outcome						:= NULL;
+							SET @y_nbr_of_elig_FTC_pcs_at_home_complete_outcome_matt_insp						:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_elig_FTC_pcs_at_home_complete_outcome_excl_matt_insp				:= NULL;		-- added 06/14/2022	
+							SET @y_nbr_of_eligible_FTC_pcs_at_home_with_incomplete_outcome 					:= NULL; 
+			
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz		
+			-- SECT 12	
+							SET @y_nbr_of_pcs_having_complete_successful_issues									:= NULL;
+							SET @y_nbr_of_pcs_having_complete_successful_issues_matt_insp						:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_pcs_having_complete_successful_issues_excl_matt_insp				:= NULL;		-- added 06/14/2022			
+							SET @y_nbr_of_pcs_having_customer_refused_issues										:= NULL;
+							SET @y_nbr_of_pcs_having_no_service_needed_issues										:= NULL;
+							SET @y_nbr_of_pcs_having_not_covered_by_warranty_issues								:= NULL;
+							SET @y_nbr_of_pcs_having_wrong_parts_sent_issues										:= NULL;
+							SET @y_nbr_of_pcs_having_exchange_issues													:= NULL;
+							SET @y_nbr_of_pcs_having_more_time_needed_issues										:= NULL;
+							SET @y_nbr_of_pcs_having_parts_required_issues											:= NULL;
+							SET @y_nbr_of_pcs_having_cleaning_not_performed_issues								:= NULL;
+							SET @y_nbr_of_pcs_having_unsuccessful_cleaning_issues									:= NULL;
+							SET @y_nbr_of_pcs_having_incomplete_mattress_inspection_issues						:= NULL;
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz				
+			
+							SET @y_nbr_of_NAH_pcs2																			:= NULL;
+							
+			-- SECT 13
+							SET @y_nbr_of_scheduled_pcs3																	:= NULL;
+							SET @y_nbr_of_scheduled_pcs3_matt_insp														:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_scheduled_pcs3_excl_matt_insp												:= NULL;		-- added 06/14/2022								
+							
+			-- SECT 14
+							SET @y_nbr_of_pcs_having_a_client_review_report 										:= NULL;
+							SET @y_nbr_of_pcs_having_a_client_review_report_with_parts_req 					:= NULL;
+							SET @y_nbr_of_pcs_having_a_client_review_report_without_parts_req 				:= NULL;
+							SET @y_nbr_of_pcs_having_parts_req_notice_in_outcome_rpt					 	 		:=	NULL;	
+							SET @y_nbr_of_pcs_rescheduled																	:= NULL;	
+							
+			-- SECT 16	
+							SET @y_nbr_of_scheduled_pcs4																	:= NULL;			
+							SET @y_nbr_of_pcs_having_normal_uts_root_cause											:= NULL;
+							SET @y_nbr_of_pcs_having_normal_uts_root_cause_matt_insp								:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_pcs_having_normal_uts_root_cause_excl_matt_insp						:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_pcs_having_manufacturer_defect_root_cause								:= NULL;
+							SET @y_nbr_of_pcs_having_manufacturer_defect_root_cause_matt_insp					:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_pcs_having_manufacturer_defect_root_cause_excl_mi					:= NULL;		-- added 06/14/2022
+							SET @y_nbr_of_pcs_having_delivery_damage_root_cause									:= NULL;
+							SET @y_nbr_of_pcs_having_delivery_damage_root_cause_matt_insp						:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_pcs_having_delivery_damage_root_cause_excl_matt_insp				:= NULL;		-- added 06/14/2022
+							SET @y_nbr_of_pcs_having_customer_caused_root_cause									:= NULL;
+							SET @y_nbr_of_pcs_having_customer_caused_root_cause_matt_insp						:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_pcs_having_customer_caused_root_cause_excl_matt_insp				:= NULL;		-- added 06/14/2022
+							SET @y_nbr_of_pcs_having_undetermined_due_to_NAH_root_cause							:= NULL;
+							SET @y_nbr_of_pcs_having_unspecified_root_cause											:= NULL;
+							SET @y_nbr_of_pcs_having_unspecified_root_cause_matt_insp							:= NULL;		-- added 06/14/2022							
+							SET @y_nbr_of_pcs_having_unspecified_root_cause_excl_matt_insp						:= NULL;		-- added 06/14/2022			
+			
+			
+							DROP TEMPORARY TABLE IF EXISTS bevy.item_outcomes;
+						
+			
+							CREATE TEMPORARY TABLE bevy.item_outcomes
+									(  client_id 																					INT,
+										yyyy_mm																						CHAR(7),
+										yyyy_wk																						CHAR(7),
+										superzone_id																				INT,
+										service_order_id																			INT,
+										furniture_id																				INT,
+										
+			-- SECT 10		
+--										nbr_of_scheduled_service_orders														INT,		-- removed 06/14/2022
+										nbr_of_scheduled_pcs																		INT,
+										nbr_of_scheduled_pcs_matt_insp														INT,		-- added 06/14/2022
+										nbr_of_scheduled_pcs_excl_matt_insp													INT,		-- added 06/14/2022
+										nbr_of_complete_pcs																		INT,
+										nbr_of_complete_pcs_matt_insp															INT,		-- added 06/14/2022
+										nbr_of_complete_pcs_excl_matt_insp													INT,		-- added 06/14/2022
+										nbr_of_incomplete_pcs																	INT,
+										nbr_of_NAH_pcs																				INT,
+										nbr_of_eligible_complete_pcs															INT,
+										nbr_of_eligible_complete_pcs_matt_insp												INT,		-- added 06/14/2022
+										nbr_of_eligible_complete_pcs_excl_matt_insp										INT,		-- added 06/14/2022
+
+			-- SECT 11
+										nbr_of_scheduled_pcs2																	INT,
+										nbr_of_ineligible_FTC_pcs																INT,						
+										nbr_of_eligible_FTC_pcs																	INT,
+										nbr_of_eligible_FTC_pcs_NAH															INT,
+										nbr_of_eligible_FTC_pcs_at_home														INT,
+										nbr_of_eligible_FTC_pcs_matt_insp													INT,		-- added 06/14/2022
+										nbr_of_eligible_FTC_pcs_excl_matt_insp												INT,		-- added 06/14/2022											
+										nbr_of_eligible_FTC_pcs_at_home_with_complete_outcome							INT,
+										nbr_of_elig_FTC_pcs_at_home_complete_outcome_matt_insp						INT,		-- added 06/14/2022
+										nbr_of_elig_FTC_pcs_at_home_complete_outcome_excl_matt_insp					INT,		-- added 06/14/2022
+										nbr_of_eligible_FTC_pcs_at_home_with_incomplete_outcome 						INT,					
+
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz	
+			-- SECT 12		
+										nbr_of_pcs_having_complete_successful_issues 									INT,
+										nbr_of_pcs_having_complete_successful_issues_matt_insp						INT,		-- added 06/14/2022
+										nbr_of_pcs_having_complete_successful_issues_excl_matt_insp					INT,		-- added 06/14/2022
+										nbr_of_pcs_having_customer_refused_issues 										INT,
+										nbr_of_pcs_having_no_service_needed_issues 										INT,
+										nbr_of_pcs_having_not_covered_by_warranty_issues 								INT,
+										nbr_of_pcs_having_wrong_parts_sent_issues 										INT,
+										nbr_of_pcs_having_exchange_issues	 												INT,
+										nbr_of_pcs_having_more_time_needed_issues 										INT,
+										nbr_of_pcs_having_parts_required_issues			 								INT,
+										nbr_of_pcs_having_cleaning_not_performed_issues 								INT,
+										nbr_of_pcs_having_unsuccessful_cleaning_issues	 								INT,
+										nbr_of_pcs_having_incomplete_mattress_inspection_issues						INT,
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz	
+			
+										nbr_of_NAH_pcs2																			INT,
+			
+			-- SECT 13
+										nbr_of_scheduled_pcs3																	INT,
+										nbr_of_scheduled_pcs3_matt_insp														INT,		-- added 06/14/2022
+										nbr_of_scheduled_pcs3_excl_matt_insp												INT,		-- added 06/14/2022
+
+			-- SECT 14
+										nbr_of_pcs_having_a_client_review_report 											INT,
+										nbr_of_pcs_having_a_client_review_report_with_parts_req 						INT,
+										nbr_of_pcs_having_a_client_review_report_without_parts_req 					INT,
+										nbr_of_pcs_having_parts_req_notice_in_outcome_rpt								INT,	
+										nbr_of_pcs_rescheduled																	INT,	
+							
+			-- SECT 16	
+										nbr_of_scheduled_pcs4																	INT,
+										nbr_of_pcs_having_normal_uts_root_cause											INT,
+										nbr_of_pcs_having_normal_uts_root_cause_matt_insp								INT,		-- added 06/14/2022
+										nbr_of_pcs_having_normal_uts_root_cause_excl_matt_insp						INT,		-- added 06/14/2022										
+										nbr_of_pcs_having_manufacturer_defect_root_cause								INT,
+										nbr_of_pcs_having_manufacturer_defect_root_cause_matt_insp					INT,		-- added 06/14/2022										
+										nbr_of_pcs_having_manufacturer_defect_root_cause_excl_mi						INT,		-- added 06/14/2022
+										nbr_of_pcs_having_delivery_damage_root_cause										INT,
+										nbr_of_pcs_having_delivery_damage_root_cause_matt_insp						INT,		-- added 06/14/2022
+										nbr_of_pcs_having_delivery_damage_root_cause_excl_matt_insp					INT,		-- added 06/14/2022
+										nbr_of_pcs_having_customer_caused_root_cause										INT,
+										nbr_of_pcs_having_customer_caused_root_cause_matt_insp						INT,		-- added 06/14/2022
+										nbr_of_pcs_having_customer_caused_root_cause_excl_matt_insp					INT,		-- added 06/14/2022
+										nbr_of_pcs_having_undetermined_due_to_NAH_root_cause							INT,
+										nbr_of_pcs_having_unspecified_root_cause											INT,
+										nbr_of_pcs_having_unspecified_root_cause_matt_insp								INT,		-- added 06/14/2022
+										nbr_of_pcs_having_unspecified_root_cause_excl_matt_insp						INT		-- added 06/14/2022
+									);
+			
+							INSERT INTO bevy.item_outcomes 
+													
+							SELECT   @y_client_id													:= s.client_id,
+										@y_yyyy_mm														:= DATE_FORMAT(r.date,'%Y-%m'),
+										@y_yyyy_wk														:= CONCAT(DATE_FORMAT(r.date,'%Y-'),LPAD(WEEK(r.date,5),2,'00')),
+										@y_superzone_id												:= z.superzone_id,
+										@y_service_order_id											:= s.id,
+										@y_furniture_id												:= fr.furniture_id,
+			
+			-- SECT 10
+										-- removed 06/14/2022			
+--										@y_nbr_of_scheduled_service_orders						:= CASE 
+--																												WHEN f.id = (SELECT MIN(furn.id) 
+--																																 FROM furniture furn
+--																																 WHERE furn.service_order_id = s.id)
+--																												THEN 1
+--																												ELSE 0
+--																												END,
+			
+			 							@y_nbr_of_scheduled_pcs										:= 1,
+
+										-- added 06/14/2022
+										@y_nbr_of_scheduled_pcs_matt_insp						:= CASE 
+																												WHEN sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																												THEN 1 
+																												ELSE 0 
+																												END,	
+
+										-- added 06/14/2022
+										@y_nbr_of_scheduled_pcs_excl_matt_insp					:= CASE 
+																												WHEN sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																												THEN 1 
+																												ELSE 0 
+																												END,		
+																										 
+										@y_nbr_of_complete_pcs										:= CASE							
+																												WHEN tr.outcome <> 'Not At Home' 
+																												 AND fr.outcome IN ('Complete','Done') 
+																												THEN 1
+																												ELSE 0
+																												END,
+
+										-- added 06/14/2022
+										@y_nbr_of_complete_pcs_matt_insp							:= CASE							
+																												WHEN tr.outcome <> 'Not At Home' 
+																												 AND fr.outcome IN ('Complete','Done') 
+																												 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,1) > 0      -- [parms: 2=furn report, fr.id=furn report id, 1=Complete Outcomes]
+																												THEN 1
+																												ELSE 0
+																												END,
+
+										-- added 06/14/2022
+										@y_nbr_of_complete_pcs_excl_matt_insp					:= CASE							
+																												WHEN tr.outcome <> 'Not At Home' 
+																												 AND fr.outcome IN ('Complete','Done') 
+																												 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,1) = 0      -- [parms: 2=furn report, fr.id=furn report id, 1=Complete Outcomes]
+																												THEN 1
+																												ELSE 0
+																												END,
+																													
+										@y_nbr_of_incomplete_pcs									:=	CASE
+																												WHEN tr.outcome <> 'Not At Home' 
+																												 AND fr.outcome = 'Incomplete'
+																												THEN 1
+																												ELSE 0
+																												END,																					
+						
+										@y_nbr_of_NAH_pcs												:= CASE
+																												WHEN tr.outcome = 'Not At Home'
+																												THEN 1
+																												ELSE 0
+																												END,			
+																													
+										@y_nbr_of_eligible_complete_pcs							:= CASE
+																												WHEN tr.outcome <> 'Not At Home'
+																												THEN 1
+																												ELSE 0
+																												END,
+																													
+										@y_nbr_of_eligible_complete_pcs_matt_insp				:= CASE
+																												WHEN tr.outcome <> 'Not At Home'
+																												AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																												THEN 1
+																												ELSE 0
+																												END,
+																													
+										@y_nbr_of_eligible_complete_pcs_excl_matt_insp		:= CASE
+																												WHEN tr.outcome <> 'Not At Home'
+																												AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																												THEN 1
+																												ELSE 0
+																												END,
+									 																															 																															 																										 
+			-- SECT 11
+										@y_nbr_of_scheduled_pcs2									:= 1,
+					
+										@y_nbr_of_ineligible_FTC_pcs								:= CASE
+																												WHEN s.episode <> 1
+																												THEN 1
+																												ELSE 0
+																												END,
+				
+			
+										@y_nbr_of_eligible_FTC_pcs									:= CASE
+																												WHEN s.episode = 1
+																												THEN 1
+																												ELSE 0
+																												END,								
+																							
+										@y_nbr_of_eligible_FTC_pcs_NAH							:=	CASE
+																												WHEN tr.outcome = 'Not At Home' AND s.episode = 1 
+																												THEN 1
+																												ELSE 0
+																												END,	
+																													
+										@y_nbr_of_eligible_FTC_pcs_at_home						:=	CASE
+																												WHEN tr.outcome <> 'Not At Home' 
+																												 AND s.episode = 1 
+																												THEN 1
+																												ELSE 0
+																												END,	
+
+										-- added 06/14/2022
+										@y_nbr_of_eligible_FTC_pcs_matt_insp					:=	CASE
+																												WHEN tr.outcome <> 'Not At Home' 
+																												 AND s.episode = 1 
+																												 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																												THEN 1
+																												ELSE 0
+																												END,	
+
+										-- added 06/14/2022
+										@y_nbr_of_eligible_FTC_pcs_excl_matt_insp				:=	CASE
+																												WHEN tr.outcome <> 'Not At Home' 
+																												 AND s.episode = 1 
+																												 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																												THEN 1
+																												ELSE 0
+																												END,	
+																														
+										@y_nbr_of_eligible_FTC_pcs_at_home_with_complete_outcome		:=	CASE
+																															WHEN tr.outcome <> 'Not At Home' 
+																															 AND s.episode = 1 
+																															 AND fr.outcome IN ('Complete','Done')
+																															THEN 1
+																															ELSE 0
+																															END,
+
+										-- added 06/14/2022																														
+										@y_nbr_of_elig_FTC_pcs_at_home_complete_outcome_matt_insp	:=	CASE
+																															WHEN tr.outcome <> 'Not At Home' 
+																															 AND s.episode = 1 
+																															 AND fr.outcome IN ('Complete','Done')
+																															 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,1) > 0      -- [parms: 2=furn report, fr.id=furn report id, 1=Complete Outcomes]
+																															THEN 1
+																															ELSE 0
+																															END,
+
+										-- added 06/14/2022																														
+										@y_nbr_of_elig_FTC_pcs_at_home_complete_outcome_excl_matt_insp	:=	CASE
+																																WHEN tr.outcome <> 'Not At Home' 
+																																 AND s.episode = 1 
+																																 AND fr.outcome IN ('Complete','Done')
+																																 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,1) = 0      -- [parms: 2=furn report, fr.id=furn report id, 1=Complete Outcomes]
+																																THEN 1
+																																ELSE 0
+																																END,
+						
+										@y_nbr_of_eligible_FTC_pcs_at_home_with_incomplete_outcome	:=	CASE
+																															WHEN tr.outcome <> 'Not At Home' 
+																															 AND s.episode = 1 AND fr.outcome = 'Incomplete'
+																															THEN 1
+																															ELSE 0
+																															END,																										 
+
+			-- SECT 12	
+										@y_nbr_of_pcs_having_complete_successful_issues					:= CASE
+																															WHEN tr.outcome = 'Not At Home'
+																															THEN 0
+																															ELSE
+																																CASE
+																																WHEN (  sf_get_count_of_specific_outcome_from_mattress_rpts_for_so_item(fr.id,'Complete')
+																																		+ sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'Successful')
+																																		+ sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Complete') ) > 0
+																																THEN 1
+																																ELSE 0
+																																END
+																															END,
+		
+										-- added 06/14/2022	
+										@y_nbr_of_pcs_having_complete_successful_issues_matt_insp	:= CASE
+																															WHEN tr.outcome = 'Not At Home'
+																															THEN 0
+																															ELSE
+																																CASE
+																																WHEN sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,1) > 0      -- [parms: 2=furn report, fr.id=furn report id, 1=Complete Outcomes]
+																																 -- AND (  sf_get_count_of_specific_outcome_from_mattress_rpts_for_so_item(fr.id,'Complete')
+																																 --		+ sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'Successful')
+																																 --		+ sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Complete') ) > 0
+																																THEN 1
+																																ELSE 0
+																																END
+																															END,
+
+										-- added 06/14/2022	
+										@y_nbr_of_pcs_having_complete_successful_issues_excl_matt_insp	:= CASE
+																																WHEN tr.outcome = 'Not At Home'
+																																THEN 0
+																																ELSE
+																																	CASE
+																																	WHEN sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,1) = 0      -- [parms: 2=furn report, fr.id=furn report id, 1=Complete Outcomes]
+																																	 AND (  sf_get_count_of_specific_outcome_from_mattress_rpts_for_so_item(fr.id,'Complete')		-- Note: this count will be 0
+																																			+ sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'Successful')
+																																			+ sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Complete') ) > 0
+																																	THEN 1
+																																	ELSE 0
+																																	END
+																																END,
+																															
+										@y_nbr_of_pcs_having_customer_refused_issues				:= CASE
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN (  sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Customer Refused') ) > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,	
+																															
+										@y_nbr_of_pcs_having_no_service_needed_issues			:= CASE				
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'No Service Needed') > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,
+																															
+										@y_nbr_of_pcs_having_not_covered_by_warranty_issues	:= CASE				
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN (sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Not Covered by Warranty') +
+																																sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'Not Covered') ) > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,							
+										
+										@y_nbr_of_pcs_having_wrong_parts_sent_issues				:= CASE				
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Wrong Parts Sent') > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,
+										
+										@y_nbr_of_pcs_having_exchange_issues						:= CASE
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Exchange') > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,
+										
+										@y_nbr_of_pcs_having_more_time_needed_issues				:= CASE
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Need More Time') > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,							
+										
+										@y_nbr_of_pcs_having_parts_required_issues				:= CASE
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN ( sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Parts Required') + 
+																																 sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'Parts Required') ) > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,						
+														
+										@y_nbr_of_pcs_having_cleaning_not_performed_issues		:= CASE
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'Cleaning Not Performed') > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,							
+										
+										@y_nbr_of_pcs_having_unsuccessful_cleaning_issues		:= CASE
+																													WHEN tr.outcome = 'Not At Home'
+																													THEN 0
+																													ELSE
+																														CASE
+																														WHEN (  sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'Unsuccessful')
+																														      + sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'') ) > 0
+																														THEN 1
+																														ELSE 0
+																														END
+																													END,						
+										
+										@y_nbr_of_pcs_having_incomplete_mattress_inspection_issues	:= CASE
+																															WHEN tr.outcome = 'Not At Home'
+																															THEN 0
+																															ELSE
+																																CASE
+																																WHEN sf_get_count_of_specific_outcome_from_mattress_rpts_for_so_item(fr.id,'Incomplete') > 0
+																																THEN 1
+																																ELSE 0
+																																END
+																															END,							
+											
+			-- zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+			
+									 	@y_nbr_of_NAH_pcs2														:= @y_nbr_of_NAH_pcs,
+			
+			-- SECT 13
+										@y_nbr_of_scheduled_pcs3												:= 1,
+										
+										-- added 06/14/2022
+										@y_nbr_of_scheduled_pcs3_matt_insp									:= CASE 
+																															WHEN sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																															THEN 1 
+																															ELSE 0 
+																															END,	
+
+										-- added 06/14/2022
+										@y_nbr_of_scheduled_pcs3_excl_matt_insp							:= CASE 
+																															WHEN sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																															THEN 1 
+																															ELSE 0 
+																															END,		
+	
+			-- SECT 14
+										@y_nbr_of_pcs_having_a_client_review_report 						:= CASE
+																															WHEN tr.outcome = 'Not At Home'
+																															THEN 0
+																															ELSE
+																																CASE
+																																WHEN sf_get_count_of_client_reviews_for_so_item(fr.id) > 0
+																																THEN 1
+																																ELSE 0
+																																END
+																															END,				
+										
+										@y_nbr_of_pcs_having_a_client_review_report_with_parts_req 		:= CASE
+																																WHEN tr.outcome = 'Not At Home'
+																																THEN 0
+																																ELSE
+																																	CASE
+																																	WHEN sf_get_count_of_client_review_rpts_with_parts_reqd_for_so_item(fr.id) > 0
+																																	THEN 1
+																																	ELSE 0
+																																	END
+																																END,		
+										
+										@y_nbr_of_pcs_having_a_client_review_report_without_parts_req 		:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN sf_get_count_of_client_reviews_for_so_item(fr.id) > 0
+																																		 AND sf_get_count_of_client_review_rpts_with_parts_reqd_for_so_item(fr.id) = 0
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,				
+										
+										@y_nbr_of_pcs_having_parts_req_notice_in_outcome_rpt_or_CRR 		:=	CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN (  sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Parts Required')
+																																				+ sf_get_count_of_specific_outcome_from_cleaning_rpts_for_so_item(fr.id,'Parts Required')
+																																			   + sf_get_count_of_client_review_rpts_with_parts_reqd_for_so_item(fr.id)
+																																			  ) > 0
+																																						  
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,				
+										
+										@y_nbr_of_pcs_rescheduled														:= CASE
+																																	WHEN tr.outcome = 'Not At Home' 
+																																	  OR sf_get_count_of_specific_outcome_from_repair_rpts_for_so_item(fr.id,'Need More Time') > 0
+																																	THEN 1
+																																	ELSE 0
+																																	END,				
+										
+			-- SECT 16	
+										@y_nbr_of_scheduled_pcs4														:= 1,
+			
+										@y_nbr_of_pcs_having_normal_uts_root_cause								:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Normal / Up to Standards'
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,				
+
+										-- added 06/14/2022
+										@y_nbr_of_pcs_having_normal_uts_root_cause_matt_insp					:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Normal / Up to Standards'
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]																																	
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,		
+
+										-- added 06/14/2022
+										@y_nbr_of_pcs_having_normal_uts_root_cause_excl_matt_insp			:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Normal / Up to Standards'
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]																																	
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,		
+
+										
+										@y_nbr_of_pcs_having_manufacturer_defect_root_cause					:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Manufacturer Defect'
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,						
+
+										-- added 06/14/2022										
+										@y_nbr_of_pcs_having_manufacturer_defect_root_cause_matt_insp		:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Manufacturer Defect'
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,	
+
+										-- added 06/14/2022										
+										@y_nbr_of_pcs_having_manufacturer_defect_root_cause_excl_mi			:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Manufacturer Defect'
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,	
+										
+										@y_nbr_of_pcs_having_delivery_damage_root_cause							:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Delivery Damage'
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,	
+
+										-- added 06/14/2022										
+										@y_nbr_of_pcs_having_delivery_damage_root_cause_matt_insp			:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Delivery Damage'
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,	
+
+										-- added 06/14/2022										
+										@y_nbr_of_pcs_having_delivery_damage_root_cause_excl_matt_insp		:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Delivery Damage'
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,	
+					
+										@y_nbr_of_pcs_having_customer_caused_root_cause							:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Customer Caused'
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,					
+
+										-- added 06/14/2022					
+										@y_nbr_of_pcs_having_customer_caused_root_cause_matt_insp			:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Customer Caused'
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,	
+
+										-- added 06/14/2022					
+										@y_nbr_of_pcs_having_customer_caused_root_cause_excl_matt_insp		:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN fr.cause = 'Customer Caused'
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,	
+										
+										@y_nbr_of_pcs_having_undetermined_due_to_NAH_root_cause				:= @y_nbr_of_NAH_pcs	,
+
+										@y_nbr_of_pcs_having_unspecified_root_cause								:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN tr.outcome <> 'Not At Home' 
+																																		 AND (fr.cause IS NULL OR fr.cause = '')
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,
+
+										-- added 06/14/2022							
+										@y_nbr_of_pcs_having_unspecified_root_cause_matt_insp					:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN tr.outcome <> 'Not At Home' 
+																																		 AND (fr.cause IS NULL OR fr.cause = '')
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) > 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END,
+
+										-- added 06/14/2022							
+										@y_nbr_of_pcs_having_unspecified_root_cause_excl_matt_insp			:= CASE
+																																	WHEN tr.outcome = 'Not At Home'
+																																	THEN 0
+																																	ELSE
+																																		CASE
+																																		WHEN tr.outcome <> 'Not At Home' 
+																																		 AND (fr.cause IS NULL OR fr.cause = '')
+																																		 AND sf_get_count_of_outcomes_from_mattress_rpts(2,fr.id,0) = 0      -- [parms: 2=furn report, fr.id=furn report id, 0=All Outcomes]
+																																		THEN 1
+																																		ELSE 0
+																																		END
+																																	END
+-- modified 06/14/2022
+							FROM routes r
+								  
+										LEFT JOIN appointments a
+										ON r.id = a.route_id
+										AND a.cancellation_id IS NULL
+										AND a.pickup <> 1
+										
+											LEFT JOIN bevy.appts_having_mult_tech_rpts appt_with_mult_tech_rpts
+											ON a.id = appt_with_mult_tech_rpts.appointment_id
+																																						
+											LEFT JOIN tech_reports tr
+											ON a.id = tr.reportable_id
+											AND tr.reportable_type = 'Appointment'		
+											
+											LEFT JOIN service_orders s
+											ON a.service_order_id = s.id
+											AND s.cancellation_id IS NULL
+																											  				
+												  		LEFT JOIN zones z
+														ON s.zone_id = z.id
+																																	
+								  						LEFT JOIN furniture f
+								  						ON s.id = f.service_order_id
+										
+								  								LEFT JOIN furniture_reports fr
+																ON f.id = fr.furniture_id
+																AND tr.id = fr.tech_report_id		
+																
+																LEFT JOIN bevy.items_missing_outcomes_rpt no_rpts
+																ON f.id = no_rpts.furniture_id
+																AND f.service_order_id = no_rpts.service_order_id
+																				
+
+							WHERE 
+							
+							  		r.date >= @from_date
+							  AND	r.date <= @thru_date 
+							  AND r.cancellation_id IS NULL
+							  AND tr.id IS NOT NULL
+							  AND ( tr.outcome = 'Not At Home' OR no_rpts.furniture_id IS NULL )	
+  							  AND ( 		appt_with_mult_tech_rpts.appointment_id IS NULL
+  							  		  OR (    appt_with_mult_tech_rpts.appointment_id IS NOT NULL 
+  							  		  		AND tr.id = 
+															( SELECT MAX(latest_tr.id)
+															  FROM tech_reports latest_tr
+															  WHERE appt_with_mult_tech_rpts.appointment_id = latest_tr.reportable_id
+															    AND appt_with_mult_tech_rpts.latest_tr_update_timestamp = latest_tr.updated_at
+															    AND latest_tr.reportable_type = 'Appointment')
+											)
+									)
+							  							  													  
+							GROUP BY s.id, f.id;
+
+ 		
+			-- ============================================================================================
+			-- Summarize the data from the temporary table and put it into a summary table to 
+			-- be used for Key Measures reporting.
+			-- ============================================================================================
+
+ 			-- SECT 10
+			 			
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_service_orders5', SUM(nbr_of_scheduled_service_orders)
+							FROM bevy.so_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_pcs', SUM(nbr_of_scheduled_pcs)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+							
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_pcs_matt_insp', SUM(nbr_of_scheduled_pcs_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;									
+							
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_pcs_excl_matt_insp', SUM(nbr_of_scheduled_pcs_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;												
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_complete_pcs', SUM(nbr_of_complete_pcs)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+							
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_complete_pcs_matt_insp', SUM(nbr_of_complete_pcs_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+							
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_complete_pcs_excl_matt_insp', SUM(nbr_of_complete_pcs_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+							
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_incomplete_pcs', SUM(nbr_of_incomplete_pcs)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_NAH_pcs', SUM(nbr_of_NAH_pcs)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+								
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_complete_pcs', SUM(nbr_of_eligible_complete_pcs)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+								
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_complete_pcs_matt_insp', SUM(nbr_of_eligible_complete_pcs_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+								
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_complete_pcs_excl_matt_insp', SUM(nbr_of_eligible_complete_pcs_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+
+			-- SECT 11
+					
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_pcs2', SUM(nbr_of_scheduled_pcs2)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_ineligible_FTC_pcs', SUM(nbr_of_ineligible_FTC_pcs)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_FTC_pcs', SUM(nbr_of_eligible_FTC_pcs)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_FTC_pcs_NAH', SUM(nbr_of_eligible_FTC_pcs_NAH)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_FTC_pcs_at_home', SUM(nbr_of_eligible_FTC_pcs_at_home)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_FTC_pcs_matt_insp', SUM(nbr_of_eligible_FTC_pcs_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_FTC_pcs_excl_matt_insp', SUM(nbr_of_eligible_FTC_pcs_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+														
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_FTC_pcs_at_home_with_complete_outcome', SUM(nbr_of_eligible_FTC_pcs_at_home_with_complete_outcome)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_elig_FTC_pcs_at_home_complete_outcome_matt_insp', SUM(nbr_of_elig_FTC_pcs_at_home_complete_outcome_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_elig_FTC_pcs_at_home_complete_outcome_excl_matt_insp', SUM(nbr_of_elig_FTC_pcs_at_home_complete_outcome_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+						
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_eligible_FTC_pcs_at_home_with_incomplete_outcome', SUM(nbr_of_eligible_FTC_pcs_at_home_with_incomplete_outcome)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+			-- SECT 12						
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_complete_successful_issues', SUM(nbr_of_pcs_having_complete_successful_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_complete_successful_issues_matt_insp', SUM(nbr_of_pcs_having_complete_successful_issues_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_complete_successful_issues_excl_matt_insp', SUM(nbr_of_pcs_having_complete_successful_issues_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_customer_refused_issues', SUM(nbr_of_pcs_having_customer_refused_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_no_service_needed_issues', SUM(nbr_of_pcs_having_no_service_needed_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_not_covered_by_warranty_issues', SUM(nbr_of_pcs_having_not_covered_by_warranty_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_wrong_parts_sent_issues', SUM(nbr_of_pcs_having_wrong_parts_sent_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_exchange_issues', SUM(nbr_of_pcs_having_exchange_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_more_time_needed_issues', SUM(nbr_of_pcs_having_more_time_needed_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_parts_required_issues', SUM(nbr_of_pcs_having_parts_required_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_cleaning_not_performed_issues', SUM(nbr_of_pcs_having_cleaning_not_performed_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_unsuccessful_cleaning_issues', SUM(nbr_of_pcs_having_unsuccessful_cleaning_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_incomplete_mattress_inspection_issues', SUM(nbr_of_pcs_having_incomplete_mattress_inspection_issues)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_NAH_pcs2', SUM(nbr_of_NAH_pcs2)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+			
+			-- SECT 13				
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_pcs3', SUM(nbr_of_scheduled_pcs3)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_pcs3_matt_insp', SUM(nbr_of_scheduled_pcs3_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_pcs3_excl_matt_insp', SUM(nbr_of_scheduled_pcs3_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+									
+			-- SECT 14
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_a_client_review_report', SUM(nbr_of_pcs_having_a_client_review_report)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_a_client_review_report_with_parts_req', SUM(nbr_of_pcs_having_a_client_review_report_with_parts_req)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_a_client_review_report_without_parts_req', SUM(nbr_of_pcs_having_a_client_review_report_without_parts_req)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_parts_req_notice_in_outcome_rpt', SUM(nbr_of_pcs_having_parts_req_notice_in_outcome_rpt)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+	
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_rescheduled', SUM(nbr_of_pcs_rescheduled)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;								
+											
+			-- SECT 16	
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_scheduled_pcs4', SUM(nbr_of_scheduled_pcs4)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;	
+			
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_normal_uts_root_cause', SUM(nbr_of_pcs_having_normal_uts_root_cause)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_normal_uts_root_cause_matt_insp', SUM(nbr_of_pcs_having_normal_uts_root_cause_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_normal_uts_root_cause_excl_matt_insp', SUM(nbr_of_pcs_having_normal_uts_root_cause_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_manufacturer_defect_root_cause', SUM(nbr_of_pcs_having_manufacturer_defect_root_cause)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_manufacturer_defect_root_cause_matt_insp', SUM(nbr_of_pcs_having_manufacturer_defect_root_cause_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_manufacturer_defect_root_cause_excl_mi', SUM(nbr_of_pcs_having_manufacturer_defect_root_cause_excl_mi)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_delivery_damage_root_cause', SUM(nbr_of_pcs_having_delivery_damage_root_cause)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_delivery_damage_root_cause_matt_insp', SUM(nbr_of_pcs_having_delivery_damage_root_cause_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_delivery_damage_root_cause_excl_matt_insp', SUM(nbr_of_pcs_having_delivery_damage_root_cause_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_customer_caused_root_cause', SUM(nbr_of_pcs_having_customer_caused_root_cause)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_customer_caused_root_cause_matt_insp', SUM(nbr_of_pcs_having_customer_caused_root_cause_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_customer_caused_root_cause_excl_matt_insp', SUM(nbr_of_pcs_having_customer_caused_root_cause_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_undetermined_due_to_NAH_root_cause', SUM(nbr_of_pcs_having_undetermined_due_to_NAH_root_cause)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_unspecified_root_cause', SUM(nbr_of_pcs_having_unspecified_root_cause)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_unspecified_root_cause_matt_insp', SUM(nbr_of_pcs_having_unspecified_root_cause_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;
+
+							-- added 06/14/2022
+							INSERT INTO bevy.client_KM_counts
+							SELECT NULL, client_id, yyyy_mm, yyyy_wk, superzone_id, 'nbr_of_pcs_having_unspecified_root_cause_excl_matt_insp', SUM(nbr_of_pcs_having_unspecified_root_cause_excl_matt_insp)
+							FROM bevy.item_outcomes
+							GROUP BY client_id, yyyy_mm, yyyy_wk, superzone_id;		
+				
+END
