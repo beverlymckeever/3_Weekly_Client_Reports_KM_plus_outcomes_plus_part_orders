@@ -1,0 +1,50 @@
+CREATE DEFINER=`bev`@`%` FUNCTION `sf_get_count_of_outcomes_from_cleaning_rpts`(
+	`parm_rpt_type_id` INT,
+	`parm_rpt_id` INT,
+	`parm_outcome_type_id` INT
+
+
+
+
+
+
+
+)
+RETURNS int(11)
+LANGUAGE SQL
+NOT DETERMINISTIC
+CONTAINS SQL
+SQL SECURITY DEFINER
+COMMENT 'Get count of outcomes  from cleaning rpts'
+BEGIN
+
+-- 	--------------------------------
+-- 
+-- 	Valid parm_rpt_type_id values are:
+--    1 = tech report
+-- 	2 = furniture report
+-- 
+--  	Valid parm_outcome_type_id values are:
+--  	0 = All outcomes
+--   	1 = Complete outcomes
+--   	2 = Incomplete outcomes
+-- 	--------------------------------
+
+	DECLARE issue_count  INT DEFAULT 0;
+	 
+	SELECT COUNT(cr.id) INTO issue_count
+	
+	FROM furniture_reports fr,
+		  cleaning_reports cr
+			
+	WHERE (	 (parm_rpt_type_id = 1 AND fr.tech_report_id = parm_rpt_id)
+	  		 OR (parm_rpt_type_id = 2 AND fr.id = parm_rpt_id)
+			)  
+	  AND	cr.furniture_report_id = fr.id
+	  AND (		parm_outcome_type_id = 0
+	    	  OR (parm_outcome_type_id = 1 AND cr.outcome IN ('Successful','Not Covered')) 
+	    	  OR (parm_outcome_type_id = 2 AND cr.outcome NOT IN ('Successful','Not Covered')) );
+	    	  
+	RETURN issue_count;
+ 
+END
