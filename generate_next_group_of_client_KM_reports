@@ -1,0 +1,19 @@
+-- PARM 1 = CLIENT ID
+-- PARM 2 = SUPERZONE ID
+-- PARM 3 = REPORT REQUESTED (1=BY MTH, 2=BY WK)
+-- PARM 4 = REPORT FORMAT (1=EXCL RESPONSE TIME SECTION, 2=INCL RESPONSE TIME SECTION
+
+-- CALL sp_client_Key_Measures_report(108,0,1,1);   		-- GBS KM Report By Mth
+-- CALL sp_client_Key_Measures_report(108,0,2,1);   		-- GBS KM Report By Wk
+
+CALL sp_client_Key_Measures_report(5,0,1,1);   			-- Montage KM Report By Mth
+CALL sp_client_Key_Measures_report(5,0,2,1);   		   -- Montage KM Report By Wk
+
+CALL sp_client_Key_Measures_report(102,0,1,1);   		-- Morris KM Report By Mth
+CALL sp_client_Key_Measures_report(102,0,2,1);   		-- Morris KM Report By Wk
+
+-- CALL sp_client_Key_Measures_report(23,0,1,1);   		-- TRP KM Report By Mth
+-- CALL sp_client_Key_Measures_report(23,0,2,1);   		-- TRP KM Report By Wk
+
+-- CALL sp_client_Key_Measures_report(270,0,1,1);   		-- Z Gallerie KM Report By Mth
+-- CALL sp_client_Key_Measures_report(270,0,2,1);   		-- Z Gallerie KM Report By Wk
