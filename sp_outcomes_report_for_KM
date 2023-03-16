@@ -1,0 +1,220 @@
+CREATE DEFINER=`bev`@`%` PROCEDURE `sp_outcomes_report_for_KM`(
+	IN `parm_client_id` INT,
+	IN `parm_superzone_id` INT
+
+
+)
+LANGUAGE SQL
+NOT DETERMINISTIC
+CONTAINS SQL
+SQL SECURITY DEFINER
+COMMENT 'This report matches SAW report Outcomes Report and the output is exported to KM files'
+BEGIN
+-- This procedure pulls s.o. outcomes for selected client and selected superzone:
+-- 
+-- Parameters: 
+--			parm1:   parm_client_id = Client Id
+--       parm2: 	parm_superzone_id		0 = all superzones, superzone id
+-- 
+
+	-- ==========================================================================
+	-- INITIALIZE SOME WORK FIELDS
+	-- ==========================================================================	
+
+	SET SESSION group_concat_max_len = 1000000;	-- Note:  if you type in mysql:  show variables like '%group_concat%'; <-- it will show
+	                                             --        that the max length for a group concat is 1024.  If you're result exceeds that
+	                                             --        length, the procedure will fail.  Therefore, need to set a session max.
+	SET @from_date	  				  := DATE_SUB( (SELECT tf.thru_date
+											   			 FROM bevy.client_KM_time_frames tf
+											   			 WHERE tf.time_period_descr = 'wk'
+															 ), 
+															 INTERVAL 6 DAY
+														 );
+											
+	SET @thru_date					  := (SELECT tf.thru_date
+											   FROM bevy.client_KM_time_frames tf
+											   WHERE tf.time_period_descr = 'wk');
+												  
+	SET @formatted_from_date	  := DATE_FORMAT(@from_date,'%m/%d/%y');
+	SET @formatted_thru_date	  := DATE_FORMAT(@thru_date,'%m/%d/%y');
+											  
+	SET @hdr_line_1  				  := CASE
+											  WHEN parm_superzone_id = 0
+											  THEN ( SELECT clients.name
+											  	 		FROM clients 
+											  	 		WHERE clients.id = parm_client_id )
+											  ELSE CONCAT( (	SELECT clients.name
+											  	 					FROM clients 
+											  	 					WHERE clients.id = parm_client_id 
+																),
+											  	 				' - ',
+											  	 				(	SELECT sz.name
+											  	 					FROM superzones sz 
+											  	 					WHERE sz.id = parm_superzone_id 
+																)
+															 )
+											  END;
+
+	SET @hdr_line_2  				  := CONCAT('Outcomes Report:  ',@formatted_from_date,' Thru ',@formatted_thru_date);	
+	SET @hdr_line_3 				  := 'Sorted By:  Service Date / Customer';
+	SET @hdr_line_3_column_F	  := "Click on column 'F' & then click on 'Wrap Text' to see full descr of 'Issues'";
+	
+	-- ==========================================================================
+	-- DELETE TEMPORARY TABLE IF IT EXISTS SO IT CAN BE RECREATED
+	-- ==========================================================================	
+
+	DROP TEMPORARY TABLE IF EXISTS bevy.service_order_outcomes;
+	
+	-- ==========================================================================
+	-- CREATE & POPULATE TEMPORARY TABLE bevy.service_order_outcomes
+	-- ==========================================================================		
+											
+	CREATE TEMPORARY TABLE  bevy.service_order_outcomes
+															  (
+																	client_name								VARCHAR(255)  DEFAULT ' ',	
+																	customer_name                    VARCHAR(255)  DEFAULT ' ',  
+																	wo_number								VARCHAR(255)  DEFAULT ' ',
+																	service_date							VARCHAR(255)  DEFAULT ' ',
+																	tech_report_outcome					VARCHAR(255)  DEFAULT ' ',					
+																	item_issues								VARCHAR(2000) DEFAULT ' ',
+																	cause										VARCHAR(255)  DEFAULT ' '
+															  );		
+
+	INSERT INTO bevy.service_order_outcomes
+
+	SELECT
+	
+			
+			c.name AS 'Client', 
+			CONCAT(cust.first_name,' ',cust.last_name) AS 'Customer',
+			s.work_order AS 'Work Order',
+			r.date AS 'Service Date',
+			tr.outcome AS 'Outcome',
+     		GROUP_CONCAT( CONCAT( i.description) SEPARATOR '\n' ) AS 'Issues', 
+			  					
+     		CASE 
+			WHEN GROUP_CONCAT( CONCAT( fr.cause ) SEPARATOR '\n' ) = '' 
+			THEN ' ' 
+			ELSE GROUP_CONCAT( CONCAT( fr.cause ) SEPARATOR '\n' )
+			END AS 'Cause'	
+
+	FROM routes r 
+				
+				LEFT JOIN appointments a
+				ON r.id = a.route_id
+				AND a.cancellation_id IS NULL
+				AND a.pickup <> 1
+				
+						LEFT JOIN tech_reports tr
+						ON a.id = tr.reportable_id
+						AND tr.reportable_type = 'Appointment'
+				
+						LEFT JOIN service_orders s
+						ON a.service_order_id = s.id
+						AND s.cancellation_id IS NULL
+						
+								LEFT JOIN clients c
+								ON s.client_id = c.id
+								
+								LEFT JOIN customers cust
+								ON s.customer_id = cust.id
+
+								LEFT JOIN zones z
+								ON s.zone_id = z.id
+								
+										LEFT JOIN superzones sz
+										ON z.superzone_id = sz.id
+								
+								LEFT JOIN furniture f
+								ON s.id = f.service_order_id
+
+										LEFT JOIN furniture_reports fr
+										ON f.id = fr.furniture_id
+		
+												LEFT JOIN repair_reports rr
+												ON fr.id = rr.furniture_report_id
+												
+									  			LEFT JOIN issues i
+			  									ON fr.furniture_id = i.item_id
+			  									
+			  										  	LEFT JOIN intents
+			  											ON i.intent_id = intents.id
+
+	WHERE
+
+		   r.date >= @from_date
+	  AND r.date <= @thru_date
+	  AND s.client_id = parm_client_id 
+	  AND (parm_superzone_id = 0 OR ( parm_superzone_id > 0 AND sz.id = parm_superzone_id ) )
+
+	GROUP BY s.id;
+ 	
+ 	-- ==========================================================================
+	-- NOW DELETE THE TEMPORARY TABLE HOLDING THE LINES OF THE REPORT, IF IT 
+	-- EXISTS, SO IT CAN BE RECREATED
+	-- ==========================================================================	
+
+	DROP TEMPORARY TABLE IF EXISTS bevy.service_order_outcomes_report_line;
+	
+	-- ==================================================================================
+	-- CREATE & POPULATE TEMPORARY TABLE bevy.service_order_outcomes_report_line
+	-- WHICH HOLDS THE LINES OF THE REPORT.
+	-- ==================================================================================		
+											
+	CREATE TEMPORARY TABLE  bevy.service_order_outcomes_report_line 
+																			  ( sect_number		INT 		  	   DEFAULT 0,
+																				 col_01_content 	VARCHAR(255)   DEFAULT ' ',
+																				 col_02_content 	VARCHAR(255)   DEFAULT ' ',	
+																				 col_03_content 	VARCHAR(255)   DEFAULT NULL,
+																				 col_04_content 	VARCHAR(255)   DEFAULT ' ',
+																				 col_05_content   VARCHAR(255)   DEFAULT ' ',
+																				 col_06_content 	VARCHAR(2000)  DEFAULT ' ',																				
+																				 col_07_content 	VARCHAR(250)   DEFAULT NULL
+																			  );
+
+	
+																	
+	-- Add Report Header Line 1 of 3
+	INSERT INTO bevy.service_order_outcomes_report_line VALUES (1,@hdr_line_1,'','','','','','');
+	
+	-- Add Report Header Line 2 of 3
+	INSERT INTO bevy.service_order_outcomes_report_line VALUES (2,@hdr_line_2,'','','','','','');	
+	
+	-- Add Report Header Line 3 of 3
+	INSERT INTO bevy.service_order_outcomes_report_line VALUES (3,@hdr_line_3,'','','','',@hdr_line_3_column_F,'');
+	
+	-- Add a line with the column headings
+	INSERT INTO bevy.service_order_outcomes_report_line VALUES (4,'Client','Customer','Work Order','Service Date','Outcome','Issues','Cause');
+		
+	-- Add detail lines
+	INSERT INTO bevy.service_order_outcomes_report_line 
+																					SELECT 
+																					'5',
+																					client_name,	
+																					customer_name,
+																					wo_number,
+																					service_date,
+																					tech_report_outcome,
+																					item_issues,
+																					cause		
+					 																FROM bevy.service_order_outcomes soo
+																					ORDER BY soo.service_date,soo.customer_name;
+
+
+	-- ==========================================================================
+	-- GENERATE Outcomes Report
+	-- ==========================================================================		
+
+	SELECT col_01_content AS '',
+			 col_02_content AS '',
+			 col_03_content AS '',
+			 col_04_content AS '',
+			 col_05_content AS '',
+			 col_06_content AS '',
+			 col_07_content AS ''
+		 		 
+			 
+	FROM bevy.service_order_outcomes_report_line 
+	ORDER BY sect_number;			
+
+END
