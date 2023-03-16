@@ -1,0 +1,27 @@
+-- This procedure calls query sp_parts_ordered_by_client
+-- There are three parameters:
+-- beg date (format: 'YYYYMMDD')
+-- end date (format: 'YYYYMMDD')
+-- client id 
+
+	SET @from_date	  				  := DATE_SUB( (SELECT tf.thru_date
+											   			 FROM bevy.client_KM_time_frames tf
+											   			 WHERE tf.time_period_descr = 'wk'
+															 ), 
+															 INTERVAL 6 DAY
+														 );
+											
+	SET @thru_date					  := (SELECT tf.thru_date
+											   FROM bevy.client_KM_time_frames tf
+											   WHERE tf.time_period_descr = 'wk');
+
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,289); 			-- Ashley DSG CHI
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,178); 			-- Ashley DSG INDY
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,179); 			-- Ashley DSG LOUY
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,313); 			-- Ashley DSG MI
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,319); 			-- Ashley DSG MI Warehouse
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,181); 			-- Ashley DSG MPHS
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,182); 			-- Ashley DSG STL
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,163); 			-- LS
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,5); 				-- Montage
+CALL sp_parts_ordered_by_client(@from_date,@thru_date,102); 			-- Morris
