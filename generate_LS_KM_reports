@@ -1,0 +1,13 @@
+-- PARM 1 = CLIENT ID
+-- PARM 2 = SUPERZONE ID
+-- PARM 3 = REPORT REQUESTED (1=BY MTH, 2=BY WK)
+-- PARM 4 = REPORT FORMAT (1=EXCL RESPONSE TIME SECTION, 2=INCL RESPONSE TIME SECTION
+
+CALL sp_client_Key_Measures_report(163,0,1,2);   		-- LS KM Report By Mth
+CALL sp_client_Key_Measures_report(163,0,2,2);   		-- LS KM Report By Wk
+
+CALL sp_client_Key_Measures_report(163,2491,1,2); 		-- LS KM Report By Mth - AZ
+CALL sp_client_Key_Measures_report(163,2533,1,2);   	-- LS KM Report By Mth - CA N
+CALL sp_client_Key_Measures_report(163,9,1,2);   		-- LS KM Report By Mth - CA S
+CALL sp_client_Key_Measures_report(163,2526,1,2);   	-- LS KM Report By Mth - NV
+CALL sp_client_Key_Measures_report(163,2547,1,2);   	-- LS KM Report By Mth - TX
